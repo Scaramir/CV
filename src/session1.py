@@ -47,3 +47,21 @@ img.header.raw["PatientName"].value # Anonymized here
 # compression format for pixel data?
 # bit depth?
 
+
+# ---- kaggel section ----
+
+# open and print image efficiently using PIL
+from PIL import Image as PILImage
+import matplotlib.pyplot as plt
+import torch 
+from torch.utils.data import Dataset
+
+# dataset class for png images to load efficiently using torch
+# __init__ takes all paths, mean and std
+# __lean__ returns the lenght of the dataset 
+# __getitem__ returns the normalized image and one-hot-encoded label
+# Dataset object goes into torch.utils.data.DataLoader
+
+class ImageDataset(Dataset):
+
+    pass
