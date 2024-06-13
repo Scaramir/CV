@@ -68,11 +68,16 @@ def get_mean_and_std(data_dir, img_list, print=False, leave_pbar=False):
     inpupt: "data_dir" string
     output: mean and std Tensors
     """
+    if len(img_list) == 0:
+        dataset = datasets.ImageFolder(
+            data_dir, transform=transforms.ToTensor()
+        )
+    else: 
     # Load the data set matching img_list
-    dataset = datasets.ImageFolder(
-        [id for id in os.listdir(data_dir) if id in img_list],
-        transform=transforms.ToTensor()
-    )
+        dataset = datasets.ImageFolder(
+            [id for id in os.listdir(data_dir) if id in img_list],
+            transform=transforms.ToTensor()
+        )
     dataloader = torch.utils.data.DataLoader(
         dataset=dataset, batch_size=1, num_workers=0
     )
@@ -266,3 +271,7 @@ def load_and_augment_images(pic_folder_path, batch_size, use_normalize=True):
     num_classes = class_names.items().__len__()
 
     return dataloaders, class_names, num_classes
+
+# TODO: build model architecture
+# NOTE: do we have to shift all classes so class 0 is 'No finding'?
+# TODO: training loop
