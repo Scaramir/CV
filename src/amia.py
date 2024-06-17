@@ -17,6 +17,7 @@ from torchvision.transforms import v2
 from torch.optim import lr_scheduler, SGD
 from tqdm.autonotebook import tqdm
 !pip install torcheval
+!pip install pycocotools
 from torcheval.metrics.functional import multiclass_confusion_matrix
 from torchinfo import summary
 import torchvision
@@ -36,6 +37,7 @@ import torch.optim as optim
 import torchvision.transforms as transforms
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection import FasterRCNN
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import matplotlib.pyplot as plt
 
 
@@ -224,7 +226,7 @@ class XRayImageDataset(Dataset):
 def load_and_augment_images(pic_folder_path, dict_path, batch_size, img_size=224, use_normalize=False):
     # split folders into 70% train and 30% test by ids
     set_seeds()
-    train_percent = 0.7
+    train_percent = 0.2
     train_ids = random.sample(os.listdir(pic_folder_path), int(train_percent*len(os.listdir(pic_folder_path))))
     test_ids = [id for id in os.listdir(pic_folder_path) if id not in train_ids]
     
@@ -351,6 +353,9 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, l
     optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
 
+    # Initialize MeanAveragePrecision metric
+    metric = MeanAveragePrecision()
+
     print('Starting the training...')
     
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
@@ -371,26 +376,33 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, l
 
         lr_scheduler.step()
 
-        # Evaluation Phase
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
+
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for images, targets in tqdm(val_dataloader, desc="Evaluation", leave=False):
+            for images, targets in val_dataloader:
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-                val_loss += losses.item()
+                # During evaluation, we expect predictions, not losses
+                outputs = model(images)
+                
+                # Calculate metrics
+                metric.update(outputs, targets)
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+        # Calculate and print the mAP
+        map_metric = metric.compute()
+        print(f"Epoch [{epoch+1}/{num_epochs}], Val mAP: {map_metric['map']:.4f}")
 
+        # Reset the metric for the next epoch
+        metric.reset()
 
 ROOT = "/kaggle/input/amia-public-challenge-2024/"
 # call augment data function
 pic_folder_path = ROOT + "train/train/"
 dict_path = "/kaggle/input/supplements/image_dict.json"
-batch_size = 4
+batch_size = 8
 
 dataloaders, class_names, num_classes = load_and_augment_images(pic_folder_path, dict_path, batch_size)
 train_and_evaluate(model, dataloaders['train'], dataloaders['test'], 2)
