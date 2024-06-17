@@ -8,22 +8,25 @@ from torchvision import datasets, transforms
 from torchvision.io import read_image
 from torchvision.transforms import v2
 import torchvision.tv_tensors as tv
-import medmnist
-from medmnist import ChestMNIST, DermaMNIST, INFO, Evaluator
+#import medmnist
+#from medmnist import ChestMNIST, DermaMNIST, INFO, Evaluator
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
 from torchvision.transforms import v2
-from torch.optim import lr_scheduler
+from torch.optim import lr_scheduler, SGD
 from tqdm.autonotebook import tqdm
+!pip install torcheval
 from torcheval.metrics.functional import multiclass_confusion_matrix
 from torchinfo import summary
 import torchvision
 from matplotlib import pyplot as plt
+from PIL import Image
 import numpy as np
 import json
 
 import torch.nn.functional as F
+from torchvision.transforms.v2 import functional as F2
 import torch.utils.data as data
 import torchvision.transforms as transforms
 
@@ -31,13 +34,45 @@ import torch.optim as optim
 
 
 import torchvision.transforms as transforms
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import FasterRCNN
 import matplotlib.pyplot as plt
 
 
 import random, warnings
 
-
 # --------------- Helper functions ------------------
+
+label_mapping = {
+    '14.0': 0,  # 'No finding' mapped to 0 (background class)
+    '0.0': 1,
+    '1.0': 2,
+    '2.0': 3,
+    '3.0': 4,
+    '4.0': 5,
+    '5.0': 6,
+    '6.0': 7,
+    '7.0': 8,
+    '8.0': 9,
+    '9.0': 10,
+    '10.0': 11,
+    '11.0': 12,
+    '12.0': 13,
+    '13.0': 14,
+}
+
+# Custom collate function to handle varying sizes of bounding boxes
+def collate_fn(batch):
+    images, targets = zip(*batch)
+    images = torch.stack(images, dim=0)
+    return images, targets
+
+# Detect OS and set num_workers accordingly
+if os.name == 'nt':  # Windows
+    num_workers = 0
+else:  # Linux and others
+    num_workers = 2
+
 def get_device():
     if torch.cuda.is_available():
         device = "cuda"
@@ -61,45 +96,64 @@ def set_seeds(seed=123420):
     print("Seeds set to {}.".format(seed))
     return
 
+class GrayscaleImageListDataset(Dataset):
+    def __init__(self, img_dir, img_list, transform=None):
+        self.img_dir = img_dir
+        self.img_list = img_list
+        self.transform = transform
 
-def get_mean_and_std(data_dir, img_list, print=False, leave_pbar=False):
-    """
-    Acquire the mean and std color values of all images (RGB-values) in the training set.
-    inpupt: "data_dir" string
-    output: mean and std Tensors
-    """
-    if len(img_list) == 0:
-        dataset = datasets.ImageFolder(
-            data_dir, transform=transforms.ToTensor()
-        )
-    else: 
-    # Load the data set matching img_list
-        dataset = datasets.ImageFolder(
-            [id for id in os.listdir(data_dir) if id in img_list],
-            transform=transforms.ToTensor()
-        )
-    dataloader = torch.utils.data.DataLoader(
-        dataset=dataset, batch_size=1, num_workers=0
-    )
+    def __len__(self):
+        return len(self.img_list)
 
-    # Calculate the mean and std of the dataset
-    channels_sum, channels_squared_sum, num_batches = 0, 0, 0
-    for data, _ in tqdm(
-        dataloader,
-        desc="Calculating mean and std of all RGB-values",
-        leave=leave_pbar,
-        colour="CYAN",
-    ):
-        non_black_pixels = data[(data != 0).any(dim=1)]
-        channels_sum += torch.mean(non_black_pixels, dim=[0, 2, 3])
-        channels_squared_sum += torch.mean(non_black_pixels**2, dim=[0, 2, 3])
-        num_batches += 1
-    mean = channels_sum / num_batches
-    # var[x] = E[x**2] - E[X]**2
-    std = (channels_squared_sum / num_batches - mean**2) ** 0.5
-    if print:
-        print("Mean: ", mean, ", Std: ", std)
-    return mean, std
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.img_dir, self.img_list[idx])
+        image = Image.open(img_path).convert("L")  # luminance aka grayscale
+        if self.transform:
+            image = self.transform(image)
+        return image
+
+
+def get_mean_and_std(img_dir, img_list, batch_size=32, print_values=False, leave_pbar=False):
+    """
+    Compute the mean and std color values of all images (grayscale values) in the specified list.
+    
+    Parameters:
+    - img_dir (str): Directory containing the images.
+    - img_list (list): List of image filenames to include in the calculation.
+    - batch_size (int): Batch size for processing images.
+    - print_values (bool): Whether to print the mean and std values.
+    - leave_pbar (bool): Whether to leave the progress bar after completion.
+    
+    Returns:
+    - mean (torch.Tensor): Mean grayscale values.
+    - std (torch.Tensor): Standard deviation of grayscale values.
+    """
+    transform = transforms.ToTensor()
+    dataset = GrayscaleImageListDataset(img_dir, img_list, transform=transform)
+    dataloader = DataLoader(dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False)
+
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    
+    channels_sum = torch.zeros(1).to(device)
+    channels_squared_sum = torch.zeros(1).to(device)
+    num_pixels = 0
+
+    for images in tqdm(dataloader, desc="Calculating mean and std of all grayscale values", leave=leave_pbar, colour="CYAN"):
+        images = images.to(device)
+        non_black_pixels = images[images != 0].view(-1)
+        num_pixels += non_black_pixels.shape[0]
+
+        channels_sum += torch.sum(non_black_pixels)
+        channels_squared_sum += torch.sum(non_black_pixels ** 2)
+    
+    mean = channels_sum / num_pixels
+    std = (channels_squared_sum / num_pixels - mean ** 2) ** 0.5
+
+    if print_values:
+        print("Mean: ", mean.cpu().numpy(), ", Std: ", std.cpu().numpy())
+    
+    return mean.cpu(), std.cpu()
+
 
 
 # --------------- Data Loader ------------------
@@ -128,7 +182,8 @@ class XRayImageDataset(Dataset):
         img_id = self.keys[idx]
         img_path = os.path.join(self.img_dir, img_id) + ".png"
         image = read_image(img_path).float()  # PyTorch function, no need to change
-        image = self.transform_norm(image)
+        if self.transform_norm:
+            image = self.transform_norm(image)
         # https://pytorch.org/tutorials/intermediate/torchvision_tutorial.html
         
 
@@ -143,61 +198,70 @@ class XRayImageDataset(Dataset):
         #         class_id: [
         #            rad_id: [[bbox],[bbox]]]
 
-        for class_id in self.dict[img_id]["classes"].items():
-            for rad in class_id.items():
-                for box in rad.items():
-                    box = box * self.img_size # is a float, maybe to int needed
-                    box_list.append(box)
-                    label_list.append(class_id)
-                    area_list.append((box[2]-box[0])*(box[3]-box[1])) # x_max-x_min * y_max-y_min
-                    iscrowd_list.append(0)
+        for class_id in self.dict[img_id]["classes"]:
+            for rad in self.dict[img_id]["classes"][class_id].items():
+                for box in rad[1]:
+                    # Ensure the box has 4 coordinates
+                    if len(box) == 4:
+                        #print(box)
+                        box = [coord * self.img_size for coord in box]  # scale coordinates
+                        box_list.append(box)
+                        label_list.append(label_mapping[class_id])  # Convert label to int
+                        area_list.append((box[2] - box[0]) * (box[3] - box[1]))  # x_max-x_min * y_max-y_min
+                        iscrowd_list.append(0)
 
         target = {
-            "boxes": tv.BoundingBoxes(box_list),
-            "labels": label_list,
-            "image_id": idx,
-            "area": torch.tensor(area_list),
-            "iscrowd": torch.tensor(iscrowd_list)
+            "boxes": torch.tensor(box_list, dtype=torch.float32),
+            "labels": torch.tensor(label_list, dtype=torch.int64),
+            "image_id": torch.tensor([idx], dtype=torch.int64),
+            "area": torch.tensor(area_list, dtype=torch.float32),
+            #"iscrowd": torch.tensor(iscrowd_list, dtype=torch.int64)
         }
 
-        return image, target, img_id
+        return image, target
 
 
-def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_normalize=True):
+def load_and_augment_images(pic_folder_path, dict_path, batch_size, img_size=224, use_normalize=False):
     # split folders into 70% train and 30% test by ids
     set_seeds()
     train_percent = 0.7
     train_ids = random.sample(os.listdir(pic_folder_path), int(train_percent*len(os.listdir(pic_folder_path))))
     test_ids = [id for id in os.listdir(pic_folder_path) if id not in train_ids]
     
-    # normalize on all train images
+    # normalize on all train images or use precomputed
     if use_normalize:
-        mean, std = get_mean_and_std(pic_folder_path, train_ids, print=False, leave_pbar=True)
+        mean, std = get_mean_and_std(pic_folder_path, train_ids, print_values=True, leave_pbar=True)
         print("Mean: ", mean, ", Std: ", std)
+    else:
+        mean = 0.57062465
+        std  = 0.24919559
     
     # remove file extension
     train_ids = [id.split(".")[0] for id in train_ids]
     test_ids = [id.split(".")[0] for id in test_ids]
+    #print first values and lengths
+    print("Train ids: ", train_ids[:5], ", Length: ", len(train_ids))
+    print("Test ids: ", test_ids[:5], ", Length: ", len(test_ids))
 
     # Data augmentation and normalization for training
     data_transforms = {
         "train": transforms.Compose(
             [
-                transforms.Resize((224, 224), antialias=True),
+                transforms.Resize((img_size, img_size), antialias=True),
                 transforms.RandomRotation(degrees=(-75, 75)),
                 transforms.RandomHorizontalFlip(),
                 transforms.RandomVerticalFlip(),
                 transforms.ColorJitter(
                     brightness=0.2, contrast=0.2, saturation=0.0, hue=0.0
                 ),
-                transforms.ToTensor(),
+                #transforms.ToTensor(),
                 transforms.RandomPerspective(distortion_scale=0.3, p=0.3),
             ]
         ),
         "test": transforms.Compose(
             [
-                transforms.Resize((224, 224), antialias=True),
-                transforms.ToTensor(),
+                transforms.Resize((img_size, img_size), antialias=True),
+                #transforms.ToTensor(),
             ]
         ),
     }
@@ -210,16 +274,12 @@ def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_norm
         )
     
     # load image_dict.json
-    dict_path = 'pre-pro/image_dict.json'
-
     with open(dict_path) as f:
-        train_dict = json.load(f)
+        og_dict = json.load(f)
 
     # train_dict where keys match train_ids
-    train_dict = {k: train_dict[k] for k in train_ids}
-    test_dict = {k: train_dict[k] for k in test_ids}
-
-    
+    train_dict = {k: og_dict[k] for k in train_ids}
+    test_dict = {k: og_dict[k] for k in test_ids}
 
     # size for images
     img_size = img_size
@@ -233,8 +293,10 @@ def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_norm
     )
 
     train_dataloader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=batch_size, shuffle=True, num_workers=0
+        train_dataset, batch_size=batch_size, shuffle=True, num_workers=num_workers, collate_fn=collate_fn
     )
+
+    
 
     test_dataset = XRayImageDataset(
         test_dict,
@@ -246,8 +308,10 @@ def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_norm
     )
 
     test_dataloader = torch.utils.data.DataLoader(
-        test_dataset, batch_size=batch_size, shuffle=False, num_workers=0
+        test_dataset, batch_size=batch_size, shuffle=False, num_workers=num_workers, collate_fn=collate_fn
     )
+
+    print("Loaded the training dataset.")
 
     dataloaders = {"train": train_dataloader, "test": test_dataloader}
 
@@ -272,6 +336,61 @@ def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_norm
 
     return dataloaders, class_names, num_classes
 
-# TODO: build model architecture
-# NOTE: do we have to shift all classes so class 0 is 'No finding'?
-# TODO: training loop
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights='DEFAULT')
+# Get the number of input features for the classifier
+in_features = model.roi_heads.box_predictor.cls_score.in_features
+
+# Replace the pre-trained head with a new one
+model.roi_heads.box_predictor = FastRCNNPredictor(in_features, 15)  # 14 classes + background
+# NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
+
+def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, lr = 0.005):
+    device = get_device()
+    model.to(device)
+    params = [p for p in model.parameters() if p.requires_grad]
+    optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+
+    print('Starting the training...')
+    
+    for epoch in tqdm(range(num_epochs), desc="Epochs"):
+        # Training Phase
+        model.train()
+        train_loss = 0
+        for images, targets in tqdm(train_dataloader, desc="Training", leave=False):
+            images = [image.to(device) for image in images]
+            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+            loss_dict = model(images, targets)
+            losses = sum(loss for loss in loss_dict.values())
+            train_loss += losses.item()
+
+            optimizer.zero_grad()
+            losses.backward()
+            optimizer.step()
+
+        lr_scheduler.step()
+
+        # Evaluation Phase
+        model.eval()
+        val_loss = 0
+        with torch.no_grad():
+            for images, targets in tqdm(val_dataloader, desc="Evaluation", leave=False):
+                images = [image.to(device) for image in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                val_loss += losses.item()
+
+        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}, Val Loss: {val_loss:.4f}")
+
+
+ROOT = "/kaggle/input/amia-public-challenge-2024/"
+# call augment data function
+pic_folder_path = ROOT + "train/train/"
+dict_path = "/kaggle/input/supplements/image_dict.json"
+batch_size = 4
+
+dataloaders, class_names, num_classes = load_and_augment_images(pic_folder_path, dict_path, batch_size)
+train_and_evaluate(model, dataloaders['train'], dataloaders['test'], 2)
