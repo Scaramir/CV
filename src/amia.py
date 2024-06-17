@@ -223,11 +223,6 @@ class XRayImageDataset(Dataset):
     def __getitem__(self, idx):
         img_id = self.keys[idx]
         img_path = os.path.join(self.img_dir, img_id) + ".png"
-        image = read_image(
-            img_path
-        )  # this returns a tensor. NOTE: check, if tensor of type uint8!
-        if self.transform_norm:
-            image = self.transform_norm(image)
 
         box_list = []
         label_list = []
@@ -261,6 +256,15 @@ class XRayImageDataset(Dataset):
             # "iscrowd": torch.tensor(iscrowd_list, dtype=torch.int64)
         }
 
+        # TODO: convert bounding boxes to tv_tensors?
+        # also pass both tensors, image and target/Boxes to the transforms and return them, so they are for sure transformed in the same way
+
+        # this returns a tensor. NOTE: check, if tensor of type uint8!
+        image = read_image(img_path)
+        if self.transform_norm:
+            image = self.transform_norm(image)
+
+
         return image, target
 
 
@@ -282,6 +286,7 @@ def load_and_augment_images(
     )
     test_ids = [id for id in os.listdir(pic_folder_path) if id not in train_ids]
 
+
     # normalize on all train images or use precomputed
     if use_normalize:
         mean, std = get_mean_and_std(
@@ -292,6 +297,7 @@ def load_and_augment_images(
         mean = 0.57062465
         std = 0.24919559
 
+
     # remove file extension
     train_ids = [id.split(".")[0] for id in train_ids]
     test_ids = [id.split(".")[0] for id in test_ids]
@@ -299,42 +305,36 @@ def load_and_augment_images(
     print("Train ids: ", train_ids[:5], ", Length: ", len(train_ids))
     print("Test ids: ", test_ids[:5], ", Length: ", len(test_ids))
 
-    # Data augmentation and normalization for training
+
+    # Data augmentation and normalization for training1
     data_transforms = {
         "train": v2.Compose(
             [
-                v2.ToDtype(
-                    torch.uint8
-                ),  # just to make sure it's uint8, probably not necessary
                 v2.Resize((img_size, img_size), antialias=True),
                 v2.RandomRotation(
                     degrees=(-10, 10)
                 ),  # all images are upright and will always be. No rotation needed? COuld be interesting to try for generalizing
-                # v2.RandomHorizontalFlip(), # flipping swaps sides of the body, not useful for this task?
-                # v2.RandomVerticalFlip(),
                 v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.0, hue=0.0),
-                v2.ToDtype(torch.float32, scale=True),
+                v2.ToDtype(torch.float32, scale=False),
                 v2.RandomPerspective(distortion_scale=0.1, p=0.1),
-                v2.RandomEqualize(p=0.5),
+                v2.RandomEqualize(p=0.4),
+                v2.Normalize(mean=mean, std=std, inplace=True),
+                # TODO: make sure, that the bounding boxes are transformed in the same way as the image. except normalized and resized. 
+                # The boxes are already scaled between [0,1]. Would it be better to scale them between [0, img_size] so they can get rescaled here as well? I guess not.  
             ]
         ),
         "test": v2.Compose(
             [
-                v2.ToDtype(
-                    torch.uint8
-                ),  # just to make sure it's uint8, probably not necessary
+                # TODO: same as above
                 v2.Resize((img_size, img_size), antialias=True),
                 v2.ToDtype(torch.float32, scale=True),
+                # Equalize all images to have a more uniform distribution of pixel intensities
+                v2.RandomEqualize(p=1.0),
+                v2.Normalize(mean=mean, std=std, inplace=True),
             ]
         ),
     }
-    if use_normalize:
-        data_transforms["train"].transforms.append(
-            v2.Normalize(mean=mean, std=std, inplace=True)
-        )
-        data_transforms["test"].transforms.append(
-            v2.Normalize(mean=mean, std=std, inplace=True)
-        )
+
 
     # load image_dict.json
     with open(dict_path) as f:
@@ -388,7 +388,7 @@ model.roi_heads.box_predictor = FastRCNNPredictor(
     in_features, 15
 )  # 14 classes + background
 # NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
-
+# TODO: Anchor boxes, how to set and adjust them?
 
 def train_and_evaluate(
     model, train_dataloader, val_dataloader, num_epochs=10, lr=0.005
@@ -397,7 +397,9 @@ def train_and_evaluate(
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=3, gamma=0.1)
+    # optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    # expo_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision()
@@ -408,11 +410,14 @@ def train_and_evaluate(
         # Training Phase
         model.train()
         train_loss = 0
+        # TODO: include mixed precision training with torch.cuda.amp.autocast() and torch.cuda.amp.GradScaler()
         for images, targets in tqdm(train_dataloader, desc="Training", leave=False):
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
             loss_dict = model(images, targets)
+            # TODO: implement a class weight to the loss. The classes are imbalanced. 
+            # NOTE: We could also use a few normal classification layers as I usually do and let the model predict the classes present, besides faster rcnn. the loss can be added as well.            
             losses = sum(loss for loss in loss_dict.values())
             train_loss += losses.item()
 
