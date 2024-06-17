@@ -163,7 +163,7 @@ class XRayImageDataset(Dataset):
         return image, target, img_id
 
 
-def load_and_augment_images(pic_folder_path, batch_size, use_normalize=True):
+def load_and_augment_images(pic_folder_path, batch_size, img_size= 224, use_normalize=True):
     # split folders into 70% train and 30% test by ids
     set_seeds()
     train_percent = 0.7
@@ -222,7 +222,7 @@ def load_and_augment_images(pic_folder_path, batch_size, use_normalize=True):
     
 
     # size for images
-    img_size = 224
+    img_size = img_size
     train_dataset = XRayImageDataset(
         train_dict,
         img_size,
