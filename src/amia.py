@@ -1,13 +1,16 @@
+# kaggle installs
+!pip install torcheval
+!pip install pycocotools
+
 import os
 import pandas as pd
 import numpy as np
 from tqdm import tqdm
 import torch
 from torch.utils.data import Dataset
-from torchvision import datasets, transforms
+from torchvision import datasets, transforms, tv_tensors
 from torchvision.io import read_image
 from torchvision.transforms import v2
-import torchvision.tv_tensors as tv
 
 # import medmnist
 # from medmnist import ChestMNIST, DermaMNIST, INFO, Evaluator
@@ -236,10 +239,16 @@ class XRayImageDataset(Dataset):
                     # Ensure the box has 4 coordinates
                     if len(box) == 4:
                         # print(box)
-                        box = [
-                            coord * self.img_size for coord in box
-                        ]  # scale coordinates
-                        box_list.append(box)
+                        #box = [
+                        #    coord * self.img_size for coord in box
+                        #]  # scale coordinates
+                        # ensure box has positive width and height
+                        if box[2] > box[0] and box[3] > box[1]:
+                            #print(box)
+                            box_list.append(box)
+                        else:
+                            print("Invalid box: ", box)
+                            box_list.append([0, 0, 1, 1])
                         label_list.append(
                             label_mapping[class_id]
                         )  # Convert label to int
@@ -248,22 +257,20 @@ class XRayImageDataset(Dataset):
                         )  # x_max-x_min * y_max-y_min
                         iscrowd_list.append(0)
 
+        boxes = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(self.img_size, self.img_size))
+        # this returns a tensor. NOTE: check, if tensor of type uint8!
+        image = read_image(img_path)
+        
+        if self.transform_norm:
+            image, boxes = self.transform_norm(image, boxes)
+
         target = {
-            "boxes": torch.tensor(box_list, dtype=torch.float32),
+            "boxes": boxes,
             "labels": torch.tensor(label_list, dtype=torch.int64),
             "image_id": torch.tensor([idx], dtype=torch.int64),
             "area": torch.tensor(area_list, dtype=torch.float32),
-            # "iscrowd": torch.tensor(iscrowd_list, dtype=torch.int64)
+            "iscrowd": torch.tensor(iscrowd_list, dtype=torch.int64),
         }
-
-        # TODO: convert bounding boxes to tv_tensors?
-        # also pass both tensors, image and target/Boxes to the transforms and return them, so they are for sure transformed in the same way
-
-        # this returns a tensor. NOTE: check, if tensor of type uint8!
-        image = read_image(img_path)
-        if self.transform_norm:
-            image = self.transform_norm(image)
-
 
         return image, target
 
@@ -318,9 +325,11 @@ def load_and_augment_images(
                 v2.ToDtype(torch.float32, scale=False),
                 v2.RandomPerspective(distortion_scale=0.1, p=0.1),
                 v2.RandomEqualize(p=0.4),
-                v2.Normalize(mean=mean, std=std, inplace=True),
-                # TODO: make sure, that the bounding boxes are transformed in the same way as the image. except normalized and resized. 
-                # The boxes are already scaled between [0,1]. Would it be better to scale them between [0, img_size] so they can get rescaled here as well? I guess not.  
+                v2.Normalize(mean=[mean], std=[std], inplace=True),
+                # NOTE: make sure, that the bounding boxes are transformed in the same way as the image. except normalized and resized.
+                # This needs testing 
+                # The boxes are already scaled between [0,1]
+                # Would it be better to scale them between [0, img_size] so they can get rescaled here as well? I guess not.  
             ]
         ),
         "test": v2.Compose(
@@ -330,7 +339,7 @@ def load_and_augment_images(
                 v2.ToDtype(torch.float32, scale=True),
                 # Equalize all images to have a more uniform distribution of pixel intensities
                 v2.RandomEqualize(p=1.0),
-                v2.Normalize(mean=mean, std=std, inplace=True),
+                v2.Normalize(mean=[mean], std=[std], inplace=True),
             ]
         ),
     }
@@ -402,45 +411,52 @@ def train_and_evaluate(
     # expo_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # Initialize MeanAveragePrecision metric
-    metric = MeanAveragePrecision()
+    metric = MeanAveragePrecision(
+        box_format="xyxy",
+        iou_type="bbox",
+        iou_thresholds=[0.1, 0.4, 0.7],
+        backend="pycocotools",
+    )
 
     print("Starting the training...")
 
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
-        # Training Phase
         model.train()
         train_loss = 0
-        # TODO: include mixed precision training with torch.cuda.amp.autocast() and torch.cuda.amp.GradScaler()
         for images, targets in tqdm(train_dataloader, desc="Training", leave=False):
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            loss_dict = model(images, targets)
-            # TODO: implement a class weight to the loss. The classes are imbalanced. 
-            # NOTE: We could also use a few normal classification layers as I usually do and let the model predict the classes present, besides faster rcnn. the loss can be added as well.            
-            losses = sum(loss for loss in loss_dict.values())
-            train_loss += losses.item()
+            try:
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
+                train_loss += losses.item()
 
-            optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
+                optimizer.zero_grad()
+                losses.backward()
+                optimizer.step()
+                lr_scheduler.step()
+            except Exception as e:
+                continue
+                print(f"Error during training: {e}")
 
-        lr_scheduler.step()
-
+        
         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
 
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for images, targets in val_dataloader:
+            for images, targets in tqdm(val_dataloader, desc="Validation", leave=False):
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
                 # During evaluation, we expect predictions, not losses
-                outputs = model(images)
-
-                # Calculate metrics
-                metric.update(outputs, targets)
+                try:
+                    outputs = model(images)
+                    # Calculate metrics
+                    metric.update(outputs, targets)
+                except Exception as e:
+                    print(f"Error during validation: {e}")
 
         # Calculate and print the mAP
         map_metric = metric.compute()
