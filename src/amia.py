@@ -1,6 +1,6 @@
 # kaggle installs
 !pip install torcheval
-!pip install pycocotools
+!pip install pycocotools --quiet
 
 import os
 import pandas as pd
@@ -271,10 +271,11 @@ class XRayImageDataset(Dataset):
             areas_tensor = torch.tensor(area_list, dtype=torch.float32)
             iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
         else:
-            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)  # Empty tensor
-            labels_tensor = torch.zeros((0,), dtype=torch.int64)  # Empty tensor
-            areas_tensor = torch.zeros((0,), dtype=torch.float32)  # Empty tensor
-            iscrowd_tensor = torch.zeros((0,), dtype=torch.int64)  # Empty tensor
+            empty_boxes = np.array([]).reshape(-1, 4)
+            boxes_tensor = torch.as_tensor(empty_boxes, dtype=torch.float32)
+            labels_tensor = torch.tensor(label_list, dtype=torch.int64)
+            areas_tensor = torch.tensor(area_list, dtype=torch.float32)
+            iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
             
         image = read_image(img_path)
         
@@ -303,7 +304,7 @@ def load_and_augment_images(
 ):
     # split folders into 70% train and 30% test by ids
     set_seeds()
-    train_percent = 0.2
+    train_percent = 0.1
     # Use the images in the ONE folder and split them into train and test
     train_ids = random.sample(
         os.listdir(pic_folder_path),
@@ -327,8 +328,10 @@ def load_and_augment_images(
     train_ids = [id.split(".")[0] for id in train_ids]
     test_ids = [id.split(".")[0] for id in test_ids]
     # print first values and lengths
-    print("Train ids: ", train_ids[:5], ", Length: ", len(train_ids))
-    print("Test ids: ", test_ids[:5], ", Length: ", len(test_ids))
+    print(f"Length of train_ids: {len(train_ids)}")
+    print(f"Length of test_ids: {len(test_ids)}")
+    #print("Train ids: ", train_ids[:5], ", Length: ", len(train_ids))
+    #print("Test ids: ", test_ids[:5], ", Length: ", len(test_ids))
 
 
     # Data augmentation and normalization for training1
@@ -352,9 +355,8 @@ def load_and_augment_images(
         ),
         "test": v2.Compose(
             [
-                # TODO: same as above
                 v2.Resize((img_size, img_size), antialias=True),
-                v2.ToDtype(torch.float32, scale=True),
+                v2.ToDtype(torch.float32, scale=False),
                 # Equalize all images to have a more uniform distribution of pixel intensities
                 v2.RandomEqualize(p=1.0),
                 v2.Normalize(mean=[mean], std=[std], inplace=True),
@@ -368,8 +370,10 @@ def load_and_augment_images(
         og_dict = json.load(f)
 
     # train_dict where keys match train_ids
-    train_dict = {k: og_dict[k] for k in train_ids}
-    test_dict = {k: og_dict[k] for k in test_ids}
+    train_dict = {k: og_dict[k] for k in train_ids if "14" not in og_dict[k]["classes"]}
+    print("Remaining train dict length: ", len(train_dict))
+    test_dict = {k: og_dict[k] for k in test_ids  if "14" not in og_dict[k]["classes"]}
+    print("Remaining test dict length: ", len(test_dict))
 
     # size for images
     img_size = img_size
@@ -417,6 +421,30 @@ model.roi_heads.box_predictor = FastRCNNPredictor(
 # NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
 # TODO: Anchor boxes, how to set and adjust them?
 
+def plot_img_bbox(img, target, pred, title):
+    
+    # plot the image and bboxes
+    # different colors for target and pred
+    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    plot(img.max())
+    if img.max() > 1:
+        img = img / 255.0
+    img = img.cpu().permute(1, 2, 0)
+    ax.imshow(img)
+    for box in target['boxes']:
+        box = box.cpu().numpy()
+        rect = plt.Rectangle(
+            (box[0], box[1]), box[2] - box[0], box[3] - box[1], linewidth=2, edgecolor="g", facecolor="none"
+        )
+        ax.add_patch(rect)
+    for box in pred['boxes']:
+        box = box.cpu().numpy()
+        rect = plt.Rectangle(
+            (box[0], box[1]), box[2] - box[0], box[3] - box[1], linewidth=2, edgecolor="r", facecolor="none"
+        )
+        ax.add_patch(rect)
+    ax.set_title(title)
+
 def train_and_evaluate(
     model, train_dataloader, val_dataloader, num_epochs=10, lr=0.005
 ):
@@ -424,15 +452,13 @@ def train_and_evaluate(
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
-    # optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    # expo_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95)
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
         box_format="xyxy",
         iou_type="bbox",
-        iou_thresholds=[0.1, 0.4, 0.7],
+        #iou_thresholds=[0.1],#[0.1, 0.4, 0.7],
         backend="pycocotools",
     )
 
@@ -479,24 +505,28 @@ def train_and_evaluate(
             for images, targets in tqdm(val_dataloader, desc="Validation", leave=True, colour="GREEN"):
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                predictions = model(images)
                 
-                #print(f"Targets: {targets}")
+                filtered_predictions = []
+                filtered_targets = []
                 
-                # During evaluation, we expect predictions, not losses
-                try:
-                    outputs = model(images)
-                    #print(f"Outputs: {outputs}")
-                    for output in outputs:
-                        if len(output['boxes']) > 0:
-                            print(f"Prediction: {output['boxes']}")
-                    # Calculate metrics
-                    metric.update(outputs, targets)
-                except Exception as e:
-                    print(f"Error during validation: {e}")
+                # check if image gets predictions and plot
+                for img, target, pred in zip(images, targets, predictions):
+                    if len(pred['boxes']) > 0:
+                        plot_img_bbox(img, target, pred, f"Image {tensor_to_string(target['filename'])}")
+                        filtered_outputs.append(pred)
+                        filtered_targets.append(target)
+
+                # Calculate metrics
+                if len(filtered_outputs) > 0:
+                    metric.update(filtered_outputs, filtered_targets)
+                    print(f"Filtered Outputs: {filtered_outputs}")
+                    print(f"Filtered Targets: {filtered_targets}")
 
         # Calculate and print the mAP
         map_metric = metric.compute()
         print(f"Epoch [{epoch+1}/{num_epochs}], Val mAP: {map_metric['map']:.4f}")
+        print(map_metric)
 
         # Reset the metric for the next epoch
         metric.reset()
