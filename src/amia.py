@@ -66,22 +66,24 @@ class_names = {
 }
 
 label_mapping = {
-    "14.0": 0,  # 'No finding' mapped to 0 (background class)
-    "0.0": 1,
-    "1.0": 2,
-    "2.0": 3,
-    "3.0": 4,
-    "4.0": 5,
-    "5.0": 6,
-    "6.0": 7,
-    "7.0": 8,
-    "8.0": 9,
-    "9.0": 10,
-    "10.0": 11,
-    "11.0": 12,
-    "12.0": 13,
-    "13.0": 14,
+    "14": 0,  # 'No finding' mapped to 0 (background class)
+    "0": 1,
+    "1": 2,
+    "2": 3,
+    "3": 4,
+    "4": 5,
+    "5": 6,
+    "6": 7,
+    "7": 8,
+    "8": 9,
+    "9": 10,
+    "10": 11,
+    "11": 12,
+    "12": 13,
+    "13": 14,
 }
+
+kaggle_img_size = 1024
 
 
 # Detect OS and set num_workers accordingly
@@ -121,6 +123,13 @@ def set_seeds(seed=123420):
         torch.backends.cudnn.deterministic = True
     print("Seeds set to {}.".format(seed))
     return
+
+def string_to_tensor(s):
+    return torch.tensor([ord(c) for c in s], dtype=torch.int64)
+
+def tensor_to_string(t):
+    return ''.join([chr(c) for c in t])
+
 
 
 class GrayscaleImageListDataset(Dataset):
@@ -237,18 +246,15 @@ class XRayImageDataset(Dataset):
             for rad in self.dict[img_id]["classes"][class_id].items():
                 for box in rad[1]:
                     # Ensure the box has 4 coordinates
-                    if len(box) == 4:
+                    #print(f"Length of box: {len(box)}")
+                    if class_id == "14":
+                        break # all boxes will be same
+                    elif len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
                         # print(box)
-                        #box = [
-                        #    coord * self.img_size for coord in box
-                        #]  # scale coordinates
-                        # ensure box has positive width and height
-                        if box[2] > box[0] and box[3] > box[1]:
-                            #print(box)
-                            box_list.append(box)
-                        else:
-                            print("Invalid box: ", box)
-                            box_list.append([0, 0, 1, 1])
+                        box = [
+                            coord * kaggle_img_size for coord in box
+                        ]  
+                        box_list.append(box)
                         label_list.append(
                             label_mapping[class_id]
                         )  # Convert label to int
@@ -256,20 +262,32 @@ class XRayImageDataset(Dataset):
                             (box[2] - box[0]) * (box[3] - box[1])
                         )  # x_max-x_min * y_max-y_min
                         iscrowd_list.append(0)
+                    else:
+                        print(f"skipping box for {img_id} with {box}")
 
-        boxes = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(self.img_size, self.img_size))
-        # this returns a tensor. NOTE: check, if tensor of type uint8!
+        if len(box_list) > 0:
+            boxes_tensor = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(self.img_size, self.img_size))
+            labels_tensor = torch.tensor(label_list, dtype=torch.int64)
+            areas_tensor = torch.tensor(area_list, dtype=torch.float32)
+            iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
+        else:
+            boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)  # Empty tensor
+            labels_tensor = torch.zeros((0,), dtype=torch.int64)  # Empty tensor
+            areas_tensor = torch.zeros((0,), dtype=torch.float32)  # Empty tensor
+            iscrowd_tensor = torch.zeros((0,), dtype=torch.int64)  # Empty tensor
+            
         image = read_image(img_path)
         
         if self.transform_norm:
-            image, boxes = self.transform_norm(image, boxes)
+            image, boxes = self.transform_norm(image, boxes_tensor)
 
         target = {
-            "boxes": boxes,
-            "labels": torch.tensor(label_list, dtype=torch.int64),
+            "boxes": boxes_tensor,
+            "labels": labels_tensor,
             "image_id": torch.tensor([idx], dtype=torch.int64),
-            "area": torch.tensor(area_list, dtype=torch.float32),
-            "iscrowd": torch.tensor(iscrowd_list, dtype=torch.int64),
+            "area": areas_tensor,
+            "iscrowd": iscrowd_tensor,
+            "filename": string_to_tensor(img_id),
         }
 
         return image, target
@@ -285,7 +303,7 @@ def load_and_augment_images(
 ):
     # split folders into 70% train and 30% test by ids
     set_seeds()
-    train_percent = 0.8
+    train_percent = 0.2
     # Use the images in the ONE folder and split them into train and test
     train_ids = random.sample(
         os.listdir(pic_folder_path),
@@ -423,36 +441,54 @@ def train_and_evaluate(
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
         model.train()
         train_loss = 0
-        for images, targets in tqdm(train_dataloader, desc="Training", leave=False):
+        inv_boxes = 0
+        for images, targets in tqdm(train_dataloader, desc="Training", leave=True, colour="BLUE"):
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
 
-            try:
-                loss_dict = model(images, targets)
-                losses = sum(loss for loss in loss_dict.values())
-                train_loss += losses.item()
+            #for target in targets:
+              #  boxes = target['boxes']
+               # for box in boxes:
+                 #   if box[2] <= box[0] or box[3] <= box[1]:
+                   #     print(f"{tensor_to_string(target['filename'])}: Invalid bounding box found: {box}")
 
-                optimizer.zero_grad()
-                losses.backward()
-                optimizer.step()
-                lr_scheduler.step()
-            except Exception as e:
-                continue
-                print(f"Error during training: {e}")
 
+            #try:
+            loss_dict = model(images, targets)
+            #print(f"Loss dict: {loss_dict}")
+            losses = sum(loss for loss in loss_dict.values())
+            train_loss += losses.item()
+
+            optimizer.zero_grad()
+            losses.backward()
+            optimizer.step()
+            lr_scheduler.step()
+            #except Exception as e:
+                # print(f"Error during training: {e}")
+                # increase inv_boxes if the error indicates
+                #if "Found invalid box" in str(e):
+                   # inv_boxes += 1
+        
+        print(f"Invalid boxes: {inv_boxes}")
         
         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
 
         model.eval()
         val_loss = 0
         with torch.no_grad():
-            for images, targets in tqdm(val_dataloader, desc="Validation", leave=False):
+            for images, targets in tqdm(val_dataloader, desc="Validation", leave=True, colour="GREEN"):
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
+                
+                #print(f"Targets: {targets}")
+                
                 # During evaluation, we expect predictions, not losses
                 try:
                     outputs = model(images)
+                    #print(f"Outputs: {outputs}")
+                    for output in outputs:
+                        if len(output['boxes']) > 0:
+                            print(f"Prediction: {output['boxes']}")
                     # Calculate metrics
                     metric.update(outputs, targets)
                 except Exception as e:
@@ -464,13 +500,14 @@ def train_and_evaluate(
 
         # Reset the metric for the next epoch
         metric.reset()
+    print("Finished Training!")
 
 
 ROOT = "/kaggle/input/amia-public-challenge-2024/"
 # call augment data function
 pic_folder_path = ROOT + "train/train/"
-dict_path = "/kaggle/input/supplements/image_dict.json"
-batch_size = 8
+dict_path = "/kaggle/input/d/floherzler/supplements/image_dict.json"
+batch_size = 10
 
 dataloaders, class_names, num_classes = load_and_augment_images(
     pic_folder_path, dict_path, batch_size, class_names
