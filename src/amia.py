@@ -444,6 +444,7 @@ def plot_img_bbox(img, target, pred, title):
         )
         ax.add_patch(rect)
     ax.set_title(title)
+    plt.savefig(f"{title}.png")
 
 def train_and_evaluate(
     model, train_dataloader, val_dataloader, num_epochs=10, lr=0.005
