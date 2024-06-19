@@ -1,7 +1,3 @@
-# kaggle installs
-!pip install torcheval
-!pip install pycocotools --quiet
-
 import os
 import pandas as pd
 import numpy as np
@@ -236,6 +232,8 @@ class XRayImageDataset(Dataset):
         img_id = self.keys[idx]
         img_path = os.path.join(self.img_dir, img_id) + ".png"
 
+        image = read_image(img_path)
+
         box_list = []
         label_list = []
         area_list = []
@@ -252,7 +250,10 @@ class XRayImageDataset(Dataset):
                     elif len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
                         # print(box)
                         box = [
-                            coord * kaggle_img_size for coord in box
+                            # coord * kaggle_img_size for coord in box
+                            # instead of multiplying by kaggle_img_size, we will multiply by image width 
+                            coord * image.shape[-1] for coord in box
+                            # coord * kaggle_img_size for coord in box
                         ]  
                         box_list.append(box)
                         label_list.append(
@@ -266,7 +267,7 @@ class XRayImageDataset(Dataset):
                         print(f"skipping box for {img_id} with {box}")
 
         if len(box_list) > 0:
-            boxes_tensor = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(self.img_size, self.img_size))
+            boxes_tensor = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(image.shape[-1], image.shape[-1])) # TODO: check if this is correct
             labels_tensor = torch.tensor(label_list, dtype=torch.int64)
             areas_tensor = torch.tensor(area_list, dtype=torch.float32)
             iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
@@ -277,10 +278,9 @@ class XRayImageDataset(Dataset):
             areas_tensor = torch.tensor(area_list, dtype=torch.float32)
             iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
             
-        image = read_image(img_path)
         
         if self.transform_norm:
-            image, boxes = self.transform_norm(image, boxes_tensor)
+            image, boxes_tensor = self.transform_norm(image, boxes_tensor)
 
         target = {
             "boxes": boxes_tensor,
@@ -452,8 +452,10 @@ def train_and_evaluate(
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=0.005, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
+    # optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
     lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
+    
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
@@ -489,7 +491,7 @@ def train_and_evaluate(
             optimizer.zero_grad()
             losses.backward()
             optimizer.step()
-            lr_scheduler.step()
+        lr_scheduler.step() # TODO: adjust scheduler 
             #except Exception as e:
                 # print(f"Error during training: {e}")
                 # increase inv_boxes if the error indicates
@@ -534,10 +536,10 @@ def train_and_evaluate(
     print("Finished Training!")
 
 
-ROOT = "/kaggle/input/amia-public-challenge-2024/"
+ROOT = "./../data/amia-public-challenge-2024/"
 # call augment data function
 pic_folder_path = ROOT + "train/train/"
-dict_path = "/kaggle/input/d/floherzler/supplements/image_dict.json"
+dict_path = "./../image_dict.json"
 batch_size = 10
 
 dataloaders, class_names, num_classes = load_and_augment_images(
