@@ -426,7 +426,7 @@ def plot_img_bbox(img, target, pred, title):
     # plot the image and bboxes
     # different colors for target and pred
     fig, ax = plt.subplots(1, 1, figsize=(10, 10))
-    plot(img.max())
+    print(img.max())
     if img.max() > 1:
         img = img / 255.0
     img = img.cpu().permute(1, 2, 0)
@@ -514,13 +514,13 @@ def train_and_evaluate(
                 for img, target, pred in zip(images, targets, predictions):
                     if len(pred['boxes']) > 0:
                         plot_img_bbox(img, target, pred, f"Image {tensor_to_string(target['filename'])}")
-                        filtered_outputs.append(pred)
+                        filtered_predictions.append(pred)
                         filtered_targets.append(target)
 
                 # Calculate metrics
-                if len(filtered_outputs) > 0:
-                    metric.update(filtered_outputs, filtered_targets)
-                    print(f"Filtered Outputs: {filtered_outputs}")
+                if len(filtered_predictions) > 0:
+                    metric.update(filtered_predictions, filtered_targets)
+                    print(f"Filtered Outputs: {filtered_predictions}")
                     print(f"Filtered Targets: {filtered_targets}")
 
         # Calculate and print the mAP
