@@ -1,7 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
-from tqdm import tqdm
+from tqdm.autonotebook import tqdm as tqdm
 import torch
 from torch.utils.data import Dataset
 from torchvision import datasets, transforms, tv_tensors
@@ -43,6 +43,12 @@ import random, warnings
 
 # --------------- Constants ------------------
 
+ROOT = "./../data/amia-public-challenge-2024/"
+# call augment data function
+pic_folder_path = ROOT + "train/train/"
+dict_path = "./pre-pro/image_dict.json"
+batch_size = 24
+
 class_names = {
     0: "Aortic enlargement",
     1: "Atelectasis",
@@ -78,8 +84,6 @@ label_mapping = {
     "12": 13,
     "13": 14,
 }
-
-kaggle_img_size = 1024
 
 
 # Detect OS and set num_workers accordingly
@@ -120,12 +124,13 @@ def set_seeds(seed=123420):
     print("Seeds set to {}.".format(seed))
     return
 
+
 def string_to_tensor(s):
     return torch.tensor([ord(c) for c in s], dtype=torch.int64)
 
-def tensor_to_string(t):
-    return ''.join([chr(c) for c in t])
 
+def tensor_to_string(t):
+    return "".join([chr(c) for c in t])
 
 
 class GrayscaleImageListDataset(Dataset):
@@ -216,6 +221,8 @@ class XRayImageDataset(Dataset):
         mean=None,
         std=None,
         transform_norm=None,
+        nms=True,
+        nms_iou_thresh=0.5,
     ):
         self.dict = dict
         self.keys = list(dict.keys())
@@ -224,6 +231,8 @@ class XRayImageDataset(Dataset):
         self.mean = mean
         self.std = std
         self.transform_norm = transform_norm
+        self.nms = nms
+        self.nms_iou_thresh = nms_iou_thresh
 
     def __len__(self):
         return len(self.keys)
@@ -238,47 +247,45 @@ class XRayImageDataset(Dataset):
         label_list = []
         area_list = []
         iscrowd_list = []
-        # get all boxes of all radiologists
-
         for class_id in self.dict[img_id]["classes"]:
+            if class_id == "14":
+                continue
+            # collect all boxes for the current class
+            box = []
             for rad in self.dict[img_id]["classes"][class_id].items():
                 for box in rad[1]:
                     # Ensure the box has 4 coordinates
-                    #print(f"Length of box: {len(box)}")
-                    if class_id == "14":
-                        break # all boxes will be same
-                    elif len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
-                        # print(box)
-                        box = [
-                            # coord * kaggle_img_size for coord in box
-                            # instead of multiplying by kaggle_img_size, we will multiply by image width 
-                            coord * image.shape[-1] for coord in box
-                            # coord * kaggle_img_size for coord in box
-                        ]  
-                        box_list.append(box)
-                        label_list.append(
-                            label_mapping[class_id]
-                        )  # Convert label to int
-                        area_list.append(
-                            (box[2] - box[0]) * (box[3] - box[1])
-                        )  # x_max-x_min * y_max-y_min
+                    if len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
+                        box_list.append([coord * image.shape[-1] for coord in box])
+                        label_list.append(label_mapping[class_id])
+                        area_list.append((box[2] - box[0]) * (box[3] - box[1]))
                         iscrowd_list.append(0)
                     else:
-                        print(f"skipping box for {img_id} with {box}")
+                        print(f"Invalid Box found at {img_id} with {box}")
+            if self.nms:
+                # Non-maximum suppression
+                boxes_to_keep = torchvision.ops.nms(
+                    torch.tensor(box_list).float(),
+                    torch.tensor([1.0] * len(box_list)),
+                    iou_threshold=self.nms_iou_thresh,
+                )
+                # now keep only the values of the indices that are in boxes_to_keep
+                box_list = [box_list[i] for i in boxes_to_keep]
+                label_list = [label_list[i] for i in boxes_to_keep]
+                area_list = [area_list[i] for i in boxes_to_keep]
+                iscrowd_list = [iscrowd_list[i] for i in boxes_to_keep]
 
         if len(box_list) > 0:
-            boxes_tensor = tv_tensors.BoundingBoxes(box_list, format="XYXY", canvas_size=(image.shape[-1], image.shape[-1])) # TODO: check if this is correct
-            labels_tensor = torch.tensor(label_list, dtype=torch.int64)
-            areas_tensor = torch.tensor(area_list, dtype=torch.float32)
-            iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
+            boxes_tensor = tv_tensors.BoundingBoxes(
+                box_list, format="XYXY", canvas_size=(image.shape[-1], image.shape[-1])
+            )
         else:
             empty_boxes = np.array([]).reshape(-1, 4)
-            boxes_tensor = torch.as_tensor(empty_boxes, dtype=torch.float32)
-            labels_tensor = torch.tensor(label_list, dtype=torch.int64)
-            areas_tensor = torch.tensor(area_list, dtype=torch.float32)
-            iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.int64)
-            
-        
+            boxes_tensor = torch.as_tensor(empty_boxes, dtype=torch.int16)
+        labels_tensor = torch.tensor(label_list, dtype=torch.int64)
+        areas_tensor = torch.tensor(area_list, dtype=torch.int32)
+        iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.uint8)
+
         if self.transform_norm:
             image, boxes_tensor = self.transform_norm(image, boxes_tensor)
 
@@ -299,19 +306,18 @@ def load_and_augment_images(
     dict_path,
     batch_size,
     class_names,
-    img_size=224,
+    img_size=448,
     use_normalize=False,
 ):
     # split folders into 70% train and 30% test by ids
     set_seeds()
-    train_percent = 0.1
+    train_percent = 0.8
     # Use the images in the ONE folder and split them into train and test
     train_ids = random.sample(
         os.listdir(pic_folder_path),
         int(train_percent * len(os.listdir(pic_folder_path))),
     )
     test_ids = [id for id in os.listdir(pic_folder_path) if id not in train_ids]
-
 
     # normalize on all train images or use precomputed
     if use_normalize:
@@ -323,57 +329,52 @@ def load_and_augment_images(
         mean = 0.57062465
         std = 0.24919559
 
-
     # remove file extension
     train_ids = [id.split(".")[0] for id in train_ids]
     test_ids = [id.split(".")[0] for id in test_ids]
     # print first values and lengths
     print(f"Length of train_ids: {len(train_ids)}")
     print(f"Length of test_ids: {len(test_ids)}")
-    #print("Train ids: ", train_ids[:5], ", Length: ", len(train_ids))
-    #print("Test ids: ", test_ids[:5], ", Length: ", len(test_ids))
-
 
     # Data augmentation and normalization for training1
     data_transforms = {
         "train": v2.Compose(
             [
-                v2.Resize((img_size, img_size), antialias=True),
+                v2.Resize(img_size, antialias=True),
                 v2.RandomRotation(
-                    degrees=(-10, 10)
+                    degrees=(-6, 6)
                 ),  # all images are upright and will always be. No rotation needed? COuld be interesting to try for generalizing
-                v2.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.0, hue=0.0),
+                v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.0, hue=0.0),
                 v2.ToDtype(torch.float32, scale=False),
                 v2.RandomPerspective(distortion_scale=0.1, p=0.1),
                 v2.RandomEqualize(p=0.4),
                 v2.Normalize(mean=[mean], std=[std], inplace=True),
-                # NOTE: make sure, that the bounding boxes are transformed in the same way as the image. except normalized and resized.
-                # This needs testing 
-                # The boxes are already scaled between [0,1]
-                # Would it be better to scale them between [0, img_size] so they can get rescaled here as well? I guess not.  
             ]
         ),
         "test": v2.Compose(
             [
-                v2.Resize((img_size, img_size), antialias=True),
+                v2.Resize(img_size, antialias=True),
                 v2.ToDtype(torch.float32, scale=False),
-                # Equalize all images to have a more uniform distribution of pixel intensities
+                # Equalize all images to have a more uniform distribution of pixel intensities, regardless of they are generally dark or light
                 v2.RandomEqualize(p=1.0),
                 v2.Normalize(mean=[mean], std=[std], inplace=True),
             ]
         ),
     }
 
-
     # load image_dict.json
     with open(dict_path) as f:
         og_dict = json.load(f)
 
     # train_dict where keys match train_ids
-    train_dict = {k: og_dict[k] for k in train_ids if "14" not in og_dict[k]["classes"]}
-    print("Remaining train dict length: ", len(train_dict))
-    test_dict = {k: og_dict[k] for k in test_ids  if "14" not in og_dict[k]["classes"]}
-    print("Remaining test dict length: ", len(test_dict))
+    train_dict = {
+        k: og_dict[k] for k in train_ids
+    }  # if "14" not in og_dict[k]["classes"]}
+    # print("Remaining train dict length: ", len(train_dict))
+    test_dict = {
+        k: og_dict[k] for k in test_ids
+    }  # if "14" not in og_dict[k]["classes"]}
+    # print("Remaining test dict length: ", len(test_dict))
 
     # size for images
     img_size = img_size
@@ -395,7 +396,7 @@ def load_and_augment_images(
 
     test_dataloader = torch.utils.data.DataLoader(
         test_dataset,
-        batch_size=batch_size,
+        batch_size=1,  # no need for batches
         shuffle=False,
         num_workers=num_workers,
         collate_fn=collate_fn,
@@ -410,6 +411,7 @@ def load_and_augment_images(
     return dataloaders, class_names, num_classes
 
 
+# --------------- Model ------------------
 model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights="DEFAULT")
 # Get the number of input features for the classifier
 in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -421,102 +423,107 @@ model.roi_heads.box_predictor = FastRCNNPredictor(
 # NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
 # TODO: Anchor boxes, how to set and adjust them?
 
+
 def plot_img_bbox(img, target, pred, title):
-    
     # plot the image and bboxes
     # different colors for target and pred
-    fig, ax = plt.subplots(1, 1, figsize=(10, 10))
+    _, ax = plt.subplots(1, 1, figsize=(10, 10))
     print(img.max())
     if img.max() > 1:
         img = img / 255.0
     img = img.cpu().permute(1, 2, 0)
     ax.imshow(img)
-    for box in target['boxes']:
+    for box in target["boxes"]:
         box = box.cpu().numpy()
         rect = plt.Rectangle(
-            (box[0], box[1]), box[2] - box[0], box[3] - box[1], linewidth=2, edgecolor="g", facecolor="none"
+            (box[0], box[1]),
+            box[2] - box[0],
+            box[3] - box[1],
+            linewidth=2,
+            edgecolor="g",
+            facecolor="none",
         )
         ax.add_patch(rect)
-    for box in pred['boxes']:
+    for box in pred["boxes"]:
         box = box.cpu().numpy()
         rect = plt.Rectangle(
-            (box[0], box[1]), box[2] - box[0], box[3] - box[1], linewidth=2, edgecolor="r", facecolor="none"
+            (box[0], box[1]),
+            box[2] - box[0],
+            box[3] - box[1],
+            linewidth=2,
+            edgecolor="r",
+            facecolor="none",
         )
         ax.add_patch(rect)
     ax.set_title(title)
-    plt.savefig(f"{title}.png")
+    # plt.savefig(f"{title}.png")
 
-def train_and_evaluate(
-    model, train_dataloader, val_dataloader, num_epochs=10, lr=0.005
-):
+
+def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, lr=0.05):
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
     # optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=10, gamma=0.1)
-    
+    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    exp_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95) # let's try this one as well
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
         box_format="xyxy",
         iou_type="bbox",
-        #iou_thresholds=[0.1],#[0.1, 0.4, 0.7],
-        backend="pycocotools",
+        # iou_thresholds=[0.1],#[0.1, 0.4, 0.7],
     )
 
     print("Starting the training...")
 
+    scaler = torch.cuda.amp.GradScaler()
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
         model.train()
         train_loss = 0
         inv_boxes = 0
-        for images, targets in tqdm(train_dataloader, desc="Training", leave=True, colour="BLUE"):
+        for images, targets in tqdm(
+            train_dataloader, desc="Training", leave=True, colour="BLUE"
+        ):
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-
-            #for target in targets:
-              #  boxes = target['boxes']
-               # for box in boxes:
-                 #   if box[2] <= box[0] or box[3] <= box[1]:
-                   #     print(f"{tensor_to_string(target['filename'])}: Invalid bounding box found: {box}")
-
-
-            #try:
-            loss_dict = model(images, targets)
-            #print(f"Loss dict: {loss_dict}")
-            losses = sum(loss for loss in loss_dict.values())
+            # Apply mixed precision training
+            with torch.cuda.amp.autocast():
+                loss_dict = model(images, targets)
+                losses = sum(loss for loss in loss_dict.values())
             train_loss += losses.item()
 
             optimizer.zero_grad()
-            losses.backward()
-            optimizer.step()
-        lr_scheduler.step() # TODO: adjust scheduler 
-            #except Exception as e:
-                # print(f"Error during training: {e}")
-                # increase inv_boxes if the error indicates
-                #if "Found invalid box" in str(e):
-                   # inv_boxes += 1
-        
+            scaler.scale(losses).backward()
+            scaler.step(optimizer)
+            scaler.update()
+        lr_scheduler.step()  # TODO: adjust scheduler
+
         print(f"Invalid boxes: {inv_boxes}")
-        
+
         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
 
         model.eval()
-        val_loss = 0
         with torch.no_grad():
-            for images, targets in tqdm(val_dataloader, desc="Validation", leave=True, colour="GREEN"):
+            for images, targets in tqdm(
+                val_dataloader, desc="Validation", leave=True, colour="GREEN"
+            ):
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
                 predictions = model(images)
-                
+
                 filtered_predictions = []
                 filtered_targets = []
-                
+
                 # check if image gets predictions and plot
                 for img, target, pred in zip(images, targets, predictions):
-                    if len(pred['boxes']) > 0:
-                        plot_img_bbox(img, target, pred, f"Image {tensor_to_string(target['filename'])}")
+                    if len(pred["boxes"]) > 0:
+                        plot_img_bbox(
+                            img,
+                            target,
+                            pred,
+                            f"Image {tensor_to_string(target['filename'])}",
+                        )
                         filtered_predictions.append(pred)
                         filtered_targets.append(target)
 
@@ -536,11 +543,7 @@ def train_and_evaluate(
     print("Finished Training!")
 
 
-ROOT = "./../data/amia-public-challenge-2024/"
-# call augment data function
-pic_folder_path = ROOT + "train/train/"
-dict_path = "./../image_dict.json"
-batch_size = 10
+# --------------- Main ------------------
 
 dataloaders, class_names, num_classes = load_and_augment_images(
     pic_folder_path, dict_path, batch_size, class_names
