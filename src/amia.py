@@ -1,6 +1,7 @@
 import os
 import pandas as pd
 import numpy as np
+import time
 from tqdm.autonotebook import tqdm as tqdm
 import torch
 from torch.utils.data import Dataset
@@ -34,7 +35,7 @@ import torch.optim as optim
 
 import torchvision.transforms as transforms
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
-from torchvision.models.detection import FasterRCNN
+from torchvision.models.detection import FasterRCNN, rpn
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import matplotlib.pyplot as plt
 
@@ -46,6 +47,7 @@ import random, warnings
 ROOT = "./../data/amia-public-challenge-2024/"
 # call augment data function
 pic_folder_path = ROOT + "train/train/"
+inf_folder_path = ROOT + "test/test/"
 dict_path = "./pre-pro/image_dict.json"
 batch_size = 24
 
@@ -303,6 +305,7 @@ class XRayImageDataset(Dataset):
 
 def load_and_augment_images(
     pic_folder_path,
+    inf_folder_path,
     dict_path,
     batch_size,
     class_names,
@@ -402,9 +405,22 @@ def load_and_augment_images(
         collate_fn=collate_fn,
     )
 
+    # image folder
+    inference_dataset = datasets.ImageFolder(
+        root=inf_folder_path, transform=data_transforms["test"]
+    )
+
+    inference_dataloader = torch.utils.data.DataLoader(
+        inference_dataset,
+        batch_size=1,
+        shuffle=False,
+        num_workers=num_workers,
+        collate_fn=collate_fn,
+    )
+
     print("Loaded the training dataset.")
 
-    dataloaders = {"train": train_dataloader, "test": test_dataloader}
+    dataloaders = {"train": train_dataloader, "test": test_dataloader, "inference": inference_dataloader}
 
     num_classes = class_names.items().__len__()
 
@@ -412,7 +428,14 @@ def load_and_augment_images(
 
 
 # --------------- Model ------------------
+anchor_generator = rpn.AnchorGenerator(
+    sizes=((32,), (48,), (64,), (96,), (128,)),
+    aspect_ratios=((0.5, 1.0, 2.0),) * 5
+)
+
+
 model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights="DEFAULT")
+model.rpn.anchor_generator = anchor_generator
 # Get the number of input features for the classifier
 in_features = model.roi_heads.box_predictor.cls_score.in_features
 
@@ -546,6 +569,46 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, l
 # --------------- Main ------------------
 
 dataloaders, class_names, num_classes = load_and_augment_images(
-    pic_folder_path, dict_path, batch_size, class_names
+    pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
 )
 train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 2)
+
+
+def evaluate_and_create_csv(model, test_dataloader, device):
+    model.eval()
+    results = []
+    
+    with torch.no_grad():
+        for images, image_ids in test_dataloader:
+            images = [image.to(device) for image in images]
+            outputs = model(images)
+            
+            for image_id, output in zip(image_ids, outputs):
+                boxes = output['boxes'].cpu().numpy()
+                labels = output['labels'].cpu().numpy()
+                scores = output['scores'].cpu().numpy()
+                
+                row = [image_id]
+                if len(boxes) > 0:
+                    targets = []
+                    for box, label, score in zip(boxes, labels, scores):
+                        # Ensure the bounding box coordinates are integers
+                        box = [int(b) for b in box]
+                        # switch class back to AMIA format
+                        targets.append(f"{int(label)-1} {score:.2f} {int(box[0])} {int(box[1])} {int(box[2])} {int(box[3])}")
+                    row.append(" ".join(targets))
+                else:
+                    # no boxes -> class 14 'No finding'
+                    row.append("14 1 0 0 1 1")
+                
+                results.append(",".join(row)) # image_id, [class score box] [...]
+    
+    # Incorporate unix timestamp into the filename
+    output_csv_path = f'submission_{int(time.time())}.csv'
+    with open(output_csv_path, 'w') as f:
+        f.write("ID,TARGET\n") # header row
+        for result in results:
+            f.write(f"{result}\n")
+
+evaluate_and_create_csv(model, dataloaders["inference"], get_device())
+
