@@ -451,11 +451,8 @@ def plot_img_bbox(img, target, pred, title):
     # plot the image and bboxes
     # different colors for target and pred
     _, ax = plt.subplots(1, 1, figsize=(10, 10))
-    print(img.max())
-    if img.max() > 1:
-        img = img / 255.0
     img = img.cpu().permute(1, 2, 0)
-    ax.imshow(img)
+    ax.imshow(img, cmap="gray")
     for box in target["boxes"]:
         box = box.cpu().numpy()
         rect = plt.Rectangle(
