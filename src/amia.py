@@ -1,5 +1,4 @@
 import os
-import pandas as pd
 import numpy as np
 import time
 from tqdm.autonotebook import tqdm as tqdm
@@ -46,8 +45,8 @@ import random, warnings
 
 ROOT = "./../data/amia-public-challenge-2024/"
 # call augment data function
-pic_folder_path = ROOT + "train/train/"
-inf_folder_path = ROOT + "test/test/"
+pic_folder_path = ROOT + "train/train"
+inf_folder_path = ROOT + "test"
 dict_path = "./pre-pro/image_dict.json"
 batch_size = 24
 
@@ -479,14 +478,14 @@ def plot_img_bbox(img, target, pred, title):
     # plt.savefig(f"{title}.png")
 
 
-def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, lr=0.05):
+def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, lr=0.005):
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
-    optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
-    # optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
-    lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    exp_lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95) # let's try this one as well
+    # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
+    optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
+    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95) # let's try this one as well
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
@@ -501,25 +500,37 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, l
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
         model.train()
         train_loss = 0
-        inv_boxes = 0
         for images, targets in tqdm(
             train_dataloader, desc="Training", leave=True, colour="BLUE"
         ):
             images = [image.to(device) for image in images]
             targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            found_invalid_box = False
+            # check if the targets(bounding boxes) are smaller than the image size and have the correct format (positive width and height)
+            for target in targets:
+                for box in target["boxes"]:
+                    if box[2] <= box[0] or box[3] <= box[1]:
+                        found_invalid_box = True
+                        print(f"Invalid Box found in training with {box}")
+                    if box[2] > images[0].shape[-1] or box[3] > images[0].shape[-2]:
+                        found_invalid_box = True
+                        print(f"Box outside of image found in training with {box}")
+                if found_invalid_box:
+                    print(f"Image: {tensor_to_string(target['filename'])}")
+                    raise ValueError("Invalid box found in training data")
+
             # Apply mixed precision training
             with torch.cuda.amp.autocast():
+                # when training the fasterrcnn model, the model returns a dict with losses.
+                # include class weights in the losses to balance the classes
                 loss_dict = model(images, targets)
                 losses = sum(loss for loss in loss_dict.values())
             train_loss += losses.item()
-
             optimizer.zero_grad()
             scaler.scale(losses).backward()
             scaler.step(optimizer)
             scaler.update()
         lr_scheduler.step()  # TODO: adjust scheduler
-
-        print(f"Invalid boxes: {inv_boxes}")
 
         print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
 
@@ -568,7 +579,7 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=10, l
 dataloaders, class_names, num_classes = load_and_augment_images(
     pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
 )
-train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 2)
+train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 30)
 
 
 def evaluate_and_create_csv(model, test_dataloader, device):
@@ -608,4 +619,3 @@ def evaluate_and_create_csv(model, test_dataloader, device):
             f.write(f"{result}\n")
 
 evaluate_and_create_csv(model, dataloaders["inference"], get_device())
-
