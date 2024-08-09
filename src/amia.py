@@ -433,7 +433,7 @@ anchor_generator = rpn.AnchorGenerator(
 )
 
 
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights="DEFAULT")
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights="DEFAULT", trainable_backbone_layers=4)
 model.rpn.anchor_generator = anchor_generator
 # Get the number of input features for the classifier
 in_features = model.roi_heads.box_predictor.cls_score.in_features
@@ -478,14 +478,21 @@ def plot_img_bbox(img, target, pred, title):
     # plt.savefig(f"{title}.png")
 
 
+# --------------- Training ------------------
+
+# since we use fasterrcnn from torchvision, we can use the losses from the model
+# we need to adjust the losses to include class weights
+# overload the fastrcnn_loss function used by forward() to include class weights
+
 def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, lr=0.005):
+    set_seeds()
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
     optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
     # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.95) # let's try this one as well
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99) # let's try this one as well
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
@@ -500,6 +507,7 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, l
     for epoch in tqdm(range(num_epochs), desc="Epochs"):
         model.train()
         train_loss = 0
+        loss_dict = {}
         for images, targets in tqdm(
             train_dataloader, desc="Training", leave=True, colour="BLUE"
         ):
@@ -524,7 +532,10 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, l
                 # when training the fasterrcnn model, the model returns a dict with losses.
                 # include class weights in the losses to balance the classes
                 loss_dict = model(images, targets)
+
                 losses = sum(loss for loss in loss_dict.values())
+                print(f"Losses: {losses}")
+                print(f"Loss Dict: {loss_dict}")
             train_loss += losses.item()
             optimizer.zero_grad()
             scaler.scale(losses).backward()
@@ -557,12 +568,28 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, l
                         )
                         filtered_predictions.append(pred)
                         filtered_targets.append(target)
+                    if (len(pred["boxes"]) == 0) and (len(target["boxes"]) == 0):
+                        # append 1-pixel boxes
+                        filtered_predictions.append(
+                            {
+                                "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
+                                "scores": torch.tensor([1]).to(device),
+                                "labels": torch.tensor([0]).to(device),
+                            }
+                        )
+                        filtered_targets.append(
+                            {
+                                "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
+                                "scores": torch.tensor([1]).to(device),
+                                "labels": torch.tensor([0]).to(device),
+                            }
+                        )
 
                 # Calculate metrics
-                if len(filtered_predictions) > 0:
-                    metric.update(filtered_predictions, filtered_targets)
-                    print(f"Filtered Outputs: {filtered_predictions}")
-                    print(f"Filtered Targets: {filtered_targets}")
+                # if len(filtered_predictions) > 0:
+                metric.update(filtered_predictions, filtered_targets)
+                #     print(f"Filtered Outputs: {filtered_predictions}")
+                #     print(f"Filtered Targets: {filtered_targets}")
 
         # Calculate and print the mAP
         map_metric = metric.compute()
