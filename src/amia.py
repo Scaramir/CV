@@ -349,7 +349,7 @@ def load_and_augment_images(
                 v2.ColorJitter(brightness=0.1, contrast=0.1, saturation=0.0, hue=0.0),
                 v2.ToDtype(torch.float32, scale=False),
                 v2.RandomPerspective(distortion_scale=0.1, p=0.1),
-                v2.RandomEqualize(p=0.4),
+                # v2.RandomEqualize(p=0.4),
                 v2.Normalize(mean=[mean], std=[std], inplace=True),
             ]
         ),
@@ -358,7 +358,7 @@ def load_and_augment_images(
                 v2.Resize(img_size, antialias=True),
                 v2.ToDtype(torch.float32, scale=False),
                 # Equalize all images to have a more uniform distribution of pixel intensities, regardless of they are generally dark or light
-                v2.RandomEqualize(p=1.0),
+                # v2.RandomEqualize(p=1.0),
                 v2.Normalize(mean=[mean], std=[std], inplace=True),
             ]
         ),
@@ -419,7 +419,11 @@ def load_and_augment_images(
 
     print("Loaded the training dataset.")
 
-    dataloaders = {"train": train_dataloader, "test": test_dataloader, "inference": inference_dataloader}
+    dataloaders = {
+        "train": train_dataloader,
+        "test": test_dataloader,
+        "inference": inference_dataloader,
+    }
 
     num_classes = class_names.items().__len__()
 
@@ -428,22 +432,33 @@ def load_and_augment_images(
 
 # --------------- Model ------------------
 anchor_generator = rpn.AnchorGenerator(
-    sizes=((32,), (48,), (64,), (96,), (128,)),
-    aspect_ratios=((0.5, 1.0, 2.0),) * 5
+    sizes=((32,), (48,), (64,), (96,), (128,)), aspect_ratios=((0.5, 1.0, 2.0),) * 5
 )
 
 
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(weights="DEFAULT", trainable_backbone_layers=4)
+model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(
+    weights="DEFAULT", trainable_backbone_layers=4
+)
 model.rpn.anchor_generator = anchor_generator
 # Get the number of input features for the classifier
 in_features = model.roi_heads.box_predictor.cls_score.in_features
 
 # Replace the pre-trained head with a new one
-model.roi_heads.box_predictor = FastRCNNPredictor(
+model.roi_head.box_predictor = FastRCNNPredictor(
     in_features, 15
 )  # 14 classes + background
 # NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
 # TODO: Anchor boxes, how to set and adjust them?
+
+# we want a second model from torchxrayvision and use its pretrained resnet50 model
+# backbone = xrv.models.ResNet("resnet50-res512-all")
+# model = FasterRCNN(
+#     backbone=backbone,
+#     num_classes=15,
+#     rpn_anchor_generator=anchor_generator,
+#     box_predictor=box_predictor
+# )
+
 
 
 def plot_img_bbox(img, target, pred, title):
@@ -484,15 +499,22 @@ def plot_img_bbox(img, target, pred, title):
 # we need to adjust the losses to include class weights
 # overload the fastrcnn_loss function used by forward() to include class weights
 
-def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, lr=0.005):
+
+def train_and_evaluate(
+    model, train_dataloader, val_dataloader, num_epochs=30, lr=0.005
+):
     set_seeds()
+    torch.cuda.empty_cache()
+    torch.clear_autocast_cache()
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
     # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
     optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
     # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(optimizer, gamma=0.99) # let's try this one as well
+    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+        optimizer, gamma=0.95
+    )  # let's try this one as well
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
@@ -559,28 +581,28 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, l
 
                 # check if image gets predictions and plot
                 for img, target, pred in zip(images, targets, predictions):
-                    if len(pred["boxes"]) > 0:
-                        plot_img_bbox(
-                            img,
-                            target,
-                            pred,
-                            f"Image {tensor_to_string(target['filename'])}",
-                        )
+                    if len(target["boxes"]) > 0:
+                        # plot_img_bbox(
+                        #     img,
+                        #     target,
+                        #     pred,
+                        #     f"Image {tensor_to_string(target['filename'])}",
+                        # )
                         filtered_predictions.append(pred)
                         filtered_targets.append(target)
-                    if (len(pred["boxes"]) == 0) and (len(target["boxes"]) == 0):
+                    elif (len(pred["boxes"]) == 0) and (len(target["boxes"]) == 0):
                         # append 1-pixel boxes
                         filtered_predictions.append(
                             {
                                 "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
-                                "scores": torch.tensor([1]).to(device),
+                                "scores": torch.tensor([1.]).to(device),
                                 "labels": torch.tensor([0]).to(device),
                             }
                         )
                         filtered_targets.append(
                             {
                                 "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
-                                "scores": torch.tensor([1]).to(device),
+                                "scores": torch.tensor([1.]).to(device),
                                 "labels": torch.tensor([0]).to(device),
                             }
                         )
@@ -606,23 +628,23 @@ def train_and_evaluate(model, train_dataloader, val_dataloader, num_epochs=30, l
 dataloaders, class_names, num_classes = load_and_augment_images(
     pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
 )
-train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 30)
+train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 5)
 
 
 def evaluate_and_create_csv(model, test_dataloader, device):
     model.eval()
     results = []
-    
+
     with torch.no_grad():
         for images, image_ids in test_dataloader:
             images = [image.to(device) for image in images]
             outputs = model(images)
-            
+
             for image_id, output in zip(image_ids, outputs):
-                boxes = output['boxes'].cpu().numpy()
-                labels = output['labels'].cpu().numpy()
-                scores = output['scores'].cpu().numpy()
-                
+                boxes = output["boxes"].cpu().numpy()
+                labels = output["labels"].cpu().numpy()
+                scores = output["scores"].cpu().numpy()
+
                 row = [image_id]
                 if len(boxes) > 0:
                     targets = []
@@ -630,19 +652,22 @@ def evaluate_and_create_csv(model, test_dataloader, device):
                         # Ensure the bounding box coordinates are integers
                         box = [int(b) for b in box]
                         # switch class back to AMIA format
-                        targets.append(f"{int(label)-1} {score:.2f} {int(box[0])} {int(box[1])} {int(box[2])} {int(box[3])}")
+                        targets.append(
+                            f"{int(label)-1} {score:.2f} {int(box[0])} {int(box[1])} {int(box[2])} {int(box[3])}"
+                        )
                     row.append(" ".join(targets))
                 else:
                     # no boxes -> class 14 'No finding'
                     row.append("14 1 0 0 1 1")
-                
-                results.append(",".join(row)) # image_id, [class score box] [...]
-    
+
+                results.append(",".join(row))  # image_id, [class score box] [...]
+
     # Incorporate unix timestamp into the filename
-    output_csv_path = f'submission_{int(time.time())}.csv'
-    with open(output_csv_path, 'w') as f:
-        f.write("ID,TARGET\n") # header row
+    output_csv_path = f"submission_{int(time.time())}.csv"
+    with open(output_csv_path, "w") as f:
+        f.write("ID,TARGET\n")  # header row
         for result in results:
             f.write(f"{result}\n")
+
 
 evaluate_and_create_csv(model, dataloaders["inference"], get_device())
