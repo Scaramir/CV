@@ -432,12 +432,13 @@ def load_and_augment_images(
 
 # --------------- Model ------------------
 anchor_generator = rpn.AnchorGenerator(
-    sizes=((32,), (48,), (64,), (96,), (128,)), aspect_ratios=((0.5, 1.0, 2.0),) * 5
+    sizes=((200,), (60,), (10,),) * 5,
+    aspect_ratios=((3.0, 1.0, 0.5),) * 5,
 )
 
 
 model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(
-    weights="DEFAULT", trainable_backbone_layers=4
+    weights="DEFAULT", trainable_backbone_layers=5
 )
 model.rpn.anchor_generator = anchor_generator
 # Get the number of input features for the classifier
@@ -458,7 +459,6 @@ model.roi_head.box_predictor = FastRCNNPredictor(
 #     rpn_anchor_generator=anchor_generator,
 #     box_predictor=box_predictor
 # )
-
 
 
 def plot_img_bbox(img, target, pred, title):
@@ -501,7 +501,7 @@ def plot_img_bbox(img, target, pred, title):
 
 
 def train_and_evaluate(
-    model, train_dataloader, val_dataloader, num_epochs=30, lr=0.005
+    model, train_dataloader, val_dataloader, num_epochs=30, lr=0.0005
 ):
     set_seeds()
     torch.cuda.empty_cache()
@@ -547,7 +547,9 @@ def train_and_evaluate(
                         print(f"Box outside of image found in training with {box}")
                 if found_invalid_box:
                     print(f"Image: {tensor_to_string(target['filename'])}")
-                    raise ValueError("Invalid box found in training data")
+                    warnings.warn("Invalid box found in training data")
+            if found_invalid_box:
+                continue
 
             # Apply mixed precision training
             with torch.cuda.amp.autocast():
