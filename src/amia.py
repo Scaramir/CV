@@ -31,15 +31,21 @@ import torchvision.transforms as transforms
 
 import torch.optim as optim
 
-
 import torchvision.transforms as transforms
 from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
 from torchvision.models.detection import FasterRCNN, rpn
+from torchvision.models.detection.backbone_utils import BackboneWithFPN
+from torchmetrics.detection.mean_ap import MeanAveragePrecision
+
+
+import torchvision.transforms as transforms
+from torchvision.models.detection.faster_rcnn import FastRCNNPredictor
+from torchvision.models.detection import FasterRCNN, rpn, RetinaNet
 from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import matplotlib.pyplot as plt
 
 import random, warnings
-
+import torchxrayvision as xrv
 
 # --------------- Constants ------------------
 
@@ -169,7 +175,7 @@ def get_mean_and_std(
     - std (torch.Tensor): Standard deviation of grayscale values.
     """
     device = get_device()
-    transform = transforms.ToTensor()
+    transform = v2.ToDtype(torch.float32, scale=True)
     dataset = GrayscaleImageListDataset(img_dir, img_list, transform=transform)
     dataloader = DataLoader(
         dataset, batch_size=batch_size, num_workers=num_workers, shuffle=False
@@ -431,34 +437,85 @@ def load_and_augment_images(
 
 
 # --------------- Model ------------------
+# considering the bboxes of the k-means analysis, we chose the following anchors at each level. We rounded up to arbitrary values to end up a bit more in the upper right of each cluster.
+# two cluster sizes were combined
 anchor_generator = rpn.AnchorGenerator(
-    sizes=((200,), (60,), (10,),) * 5,
-    aspect_ratios=((3.0, 1.0, 0.5),) * 5,
+    sizes=((30,), (60,), (130,), (200,))
+    * 5,  # times 5 'cause we want all sizes on all layers
+    aspect_ratios=(
+        (
+            0.32,
+            1.0,
+            1.8,
+        ),
+    )
+    * 5,  # times 5 'cause 5 feature maps'
 )
 
+# use pre-trained on chest x-rays
+backbone = xrv.models.ResNet(weights="resnet50-res512-all")
+backbone = torch.nn.Sequential(*list(backbone.model.children())[:-2])
 
-model = torchvision.models.detection.fasterrcnn_resnet50_fpn_v2(
-    weights="DEFAULT", trainable_backbone_layers=5
+def fasterrcnn_reshape_transform(x):
+    # Reshape the output of the FasterRCNN model to a format that can be used for visualization and evaluation purposes (EigenCam )
+    target_size = x["pool"].size()[-2:]
+    activations = []
+    for _, value in x.items():
+        activations.append(
+            torch.nn.functional.interpolate(
+                torch.abs(value), target_size, mode="bilinear"
+            )
+        )
+    activations = torch.cat(activations, axis=1)
+    return activations
+
+
+# Define the layers to return feature maps from
+return_layers = {
+    "4": "0",  # Corresponds to layer1
+    "5": "1",  # Corresponds to layer2
+    "6": "2",  # Corresponds to layer3
+    "7": "3",  # Corresponds to layer4
+    # TODO where is number '4'? roi_align has #5 feature maps
+}
+
+# Construct the BackboneWithFPN
+backbone_with_fpn = BackboneWithFPN(
+    backbone,
+    return_layers=return_layers,  # The layers we want to use
+    in_channels_list=[
+        256,
+        512,
+        1024,
+        2048,
+    ],  # Corresponding in_channels for these layers
+    out_channels=256,  # Out channels for FPN layers
 )
-model.rpn.anchor_generator = anchor_generator
-# Get the number of input features for the classifier
-in_features = model.roi_heads.box_predictor.cls_score.in_features
 
-# Replace the pre-trained head with a new one
-model.roi_head.box_predictor = FastRCNNPredictor(
-    in_features, 15
-)  # 14 classes + background
-# NOTE: do we have to shift all classes so class 0 is 'No finding'? did this in the label_mapping
-# TODO: Anchor boxes, how to set and adjust them?
+roi_align = torchvision.ops.MultiScaleRoIAlign(
+    featmap_names=["0", "1", "2", "3", "4"], output_size=7, sampling_ratio=2
+)
 
-# we want a second model from torchxrayvision and use its pretrained resnet50 model
-# backbone = xrv.models.ResNet("resnet50-res512-all")
-# model = FasterRCNN(
-#     backbone=backbone,
-#     num_classes=15,
-#     rpn_anchor_generator=anchor_generator,
-#     box_predictor=box_predictor
-# )
+model = torchvision.models.detection.FasterRCNN(
+    backbone_with_fpn,
+    num_classes=15,
+    # min_size=448, # produces NaN losses
+    # max_size=448,
+    # image_mean=[0.57062465], # TODO: to prevent ImageNet normalizing, we can change this to m=0, s=1 and rely on our own normalization :)
+    # image_std=[0.24919559],
+    image_mean=[0],
+    image_std=[1],
+    rpn_anchor_generator=anchor_generator,
+    box_roi_pool=roi_align,
+    # box_batch_size_per_image=128,
+    # rpn_pre_nms_top_n_train=2000,
+    # rpn_post_nms_top_n_test=1000,
+    # rpn_post_nms_top_n_train=2000,
+    # rpn_post_nms_top_n_test=1000,
+    rpn_nms_thresh=0.5,  # lower NMS -> fewer proposals
+    box_score_thresh=0.1,  # increase to filter low-confidence detections
+    box_detections_per_img=50,  # default 100 -> overkill?
+)
 
 
 def plot_img_bbox(img, target, pred, title):
