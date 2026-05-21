@@ -1,3 +1,4 @@
+import contextlib
 import os
 import numpy as np
 import time
@@ -45,6 +46,8 @@ from torchmetrics.detection.mean_ap import MeanAveragePrecision
 import matplotlib.pyplot as plt
 
 import random, warnings
+import mlflow
+import mlflow.pytorch
 import torchxrayvision as xrv
 
 # --------------- Constants ------------------
@@ -439,22 +442,25 @@ def load_and_augment_images(
 # --------------- Model ------------------
 # considering the bboxes of the k-means analysis, we chose the following anchors at each level. We rounded up to arbitrary values to end up a bit more in the upper right of each cluster.
 # two cluster sizes were combined
-anchor_generator = rpn.AnchorGenerator(
-    sizes=((30,), (60,), (130,), (200,))
-    * 5,  # times 5 'cause we want all sizes on all layers
-    aspect_ratios=(
-        (
-            0.32,
-            1.0,
-            1.8,
-        ),
+def build_anchor_generator():
+    return rpn.AnchorGenerator(
+        sizes=((30,), (60,), (130,), (200,))
+        * 5,  # times 5 'cause we want all sizes on all layers
+        aspect_ratios=(
+            (
+                0.32,
+                1.0,
+                1.8,
+            ),
+        )
+        * 5,  # times 5 'cause 5 feature maps'
     )
-    * 5,  # times 5 'cause 5 feature maps'
-)
 
-# use pre-trained on chest x-rays
-backbone = xrv.models.ResNet(weights="resnet50-res512-all")
-backbone = torch.nn.Sequential(*list(backbone.model.children())[:-2])
+
+def build_backbone_with_fpn():
+    # use pre-trained on chest x-rays
+    backbone = xrv.models.ResNet(weights="resnet50-res512-all")
+    backbone = torch.nn.Sequential(*list(backbone.model.children())[:-2])
 
 def fasterrcnn_reshape_transform(x):
     # Reshape the output of the FasterRCNN model to a format that can be used for visualization and evaluation purposes (EigenCam )
@@ -470,52 +476,71 @@ def fasterrcnn_reshape_transform(x):
     return activations
 
 
-# Define the layers to return feature maps from
-return_layers = {
-    "4": "0",  # Corresponds to layer1
-    "5": "1",  # Corresponds to layer2
-    "6": "2",  # Corresponds to layer3
-    "7": "3",  # Corresponds to layer4
-    # TODO where is number '4'? roi_align has #5 feature maps
-}
+    # Define the layers to return feature maps from
+    return_layers = {
+        "4": "0",  # Corresponds to layer1
+        "5": "1",  # Corresponds to layer2
+        "6": "2",  # Corresponds to layer3
+        "7": "3",  # Corresponds to layer4
+        # TODO where is number '4'? roi_align has #5 feature maps
+    }
 
-# Construct the BackboneWithFPN
-backbone_with_fpn = BackboneWithFPN(
-    backbone,
-    return_layers=return_layers,  # The layers we want to use
-    in_channels_list=[
-        256,
-        512,
-        1024,
-        2048,
-    ],  # Corresponding in_channels for these layers
-    out_channels=256,  # Out channels for FPN layers
-)
+    # Construct the BackboneWithFPN
+    backbone_with_fpn = BackboneWithFPN(
+        backbone,
+        return_layers=return_layers,  # The layers we want to use
+        in_channels_list=[
+            256,
+            512,
+            1024,
+            2048,
+        ],  # Corresponding in_channels for these layers
+        out_channels=256,  # Out channels for FPN layers
+    )
+    return backbone_with_fpn
 
-roi_align = torchvision.ops.MultiScaleRoIAlign(
-    featmap_names=["0", "1", "2", "3", "4"], output_size=7, sampling_ratio=2
-)
 
-model = torchvision.models.detection.FasterRCNN(
-    backbone_with_fpn,
-    num_classes=15,
-    # min_size=448, # produces NaN losses
-    # max_size=448,
-    # image_mean=[0.57062465], # TODO: to prevent ImageNet normalizing, we can change this to m=0, s=1 and rely on our own normalization :)
-    # image_std=[0.24919559],
-    image_mean=[0],
-    image_std=[1],
-    rpn_anchor_generator=anchor_generator,
-    box_roi_pool=roi_align,
-    # box_batch_size_per_image=128,
-    # rpn_pre_nms_top_n_train=2000,
-    # rpn_post_nms_top_n_test=1000,
-    # rpn_post_nms_top_n_train=2000,
-    # rpn_post_nms_top_n_test=1000,
-    rpn_nms_thresh=0.5,  # lower NMS -> fewer proposals
-    box_score_thresh=0.1,  # increase to filter low-confidence detections
-    box_detections_per_img=50,  # default 100 -> overkill?
-)
+def build_fasterrcnn_model(num_classes=15):
+    anchor_generator = build_anchor_generator()
+    backbone_with_fpn = build_backbone_with_fpn()
+    roi_align = torchvision.ops.MultiScaleRoIAlign(
+        featmap_names=["0", "1", "2", "3", "4"], output_size=7, sampling_ratio=2
+    )
+    model = torchvision.models.detection.FasterRCNN(
+        backbone_with_fpn,
+        num_classes=num_classes,
+        # min_size=448, # produces NaN losses
+        # max_size=448,
+        # image_mean=[0.57062465], # TODO: to prevent ImageNet normalizing, we can change this to m=0, s=1 and rely on our own normalization :)
+        # image_std=[0.24919559],
+        image_mean=[0],
+        image_std=[1],
+        rpn_anchor_generator=anchor_generator,
+        box_roi_pool=roi_align,
+        # box_batch_size_per_image=128,
+        # rpn_pre_nms_top_n_train=2000,
+        # rpn_post_nms_top_n_test=1000,
+        # rpn_post_nms_top_n_train=2000,
+        # rpn_post_nms_top_n_test=1000,
+        rpn_nms_thresh=0.5,  # lower NMS -> fewer proposals
+        box_score_thresh=0.1,  # increase to filter low-confidence detections
+        box_detections_per_img=50,  # default 100 -> overkill?
+    )
+    return model
+
+
+def build_retinanet_model(num_classes=15):
+    anchor_generator = build_anchor_generator()
+    backbone_with_fpn = build_backbone_with_fpn()
+    model = RetinaNet(
+        backbone_with_fpn,
+        num_classes=num_classes,
+        anchor_generator=anchor_generator,
+        score_thresh=0.1,
+        nms_thresh=0.5,
+        detections_per_img=50,
+    )
+    return model
 
 
 def plot_img_bbox(img, target, pred, title):
@@ -558,7 +583,15 @@ def plot_img_bbox(img, target, pred, title):
 
 
 def train_and_evaluate(
-    model, train_dataloader, val_dataloader, num_epochs=30, lr=0.0005
+    model,
+    train_dataloader,
+    val_dataloader,
+    num_epochs=30,
+    lr=0.0005,
+    weight_decay=0.0005,
+    experiment_name="amia",
+    run_name=None,
+    log_with_mlflow=True,
 ):
     set_seeds()
     torch.cuda.empty_cache()
@@ -566,8 +599,8 @@ def train_and_evaluate(
     device = get_device()
     model.to(device)
     params = [p for p in model.parameters() if p.requires_grad]
-    # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=0.0005)
-    optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=0.0005)
+    # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+    optimizer = torch.optim.Adamax(params, lr=lr, weight_decay=weight_decay)
     # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
     lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
         optimizer, gamma=0.95
@@ -580,114 +613,161 @@ def train_and_evaluate(
         # iou_thresholds=[0.1],#[0.1, 0.4, 0.7],
     )
 
-    print("Starting the training...")
+    train_losses = []
+    map_history = []
 
-    scaler = torch.cuda.amp.GradScaler()
-    for epoch in tqdm(range(num_epochs), desc="Epochs"):
-        model.train()
-        train_loss = 0
-        loss_dict = {}
-        for images, targets in tqdm(
-            train_dataloader, desc="Training", leave=True, colour="BLUE"
-        ):
-            images = [image.to(device) for image in images]
-            targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-            found_invalid_box = False
-            # check if the targets(bounding boxes) are smaller than the image size and have the correct format (positive width and height)
-            for target in targets:
-                for box in target["boxes"]:
-                    if box[2] <= box[0] or box[3] <= box[1]:
-                        found_invalid_box = True
-                        print(f"Invalid Box found in training with {box}")
-                    if box[2] > images[0].shape[-1] or box[3] > images[0].shape[-2]:
-                        found_invalid_box = True
-                        print(f"Box outside of image found in training with {box}")
-                if found_invalid_box:
-                    print(f"Image: {tensor_to_string(target['filename'])}")
-                    warnings.warn("Invalid box found in training data")
-            if found_invalid_box:
-                continue
+    if log_with_mlflow:
+        mlflow.set_experiment(experiment_name)
+        run_context = mlflow.start_run(run_name=run_name)
+    else:
+        run_context = contextlib.nullcontext()
 
-            # Apply mixed precision training
-            with torch.cuda.amp.autocast():
-                # when training the fasterrcnn model, the model returns a dict with losses.
-                # include class weights in the losses to balance the classes
-                loss_dict = model(images, targets)
+    with run_context:
+        if log_with_mlflow:
+            mlflow.log_params(
+                {
+                    "num_epochs": num_epochs,
+                    "learning_rate": lr,
+                    "weight_decay": weight_decay,
+                    "optimizer": optimizer.__class__.__name__,
+                    "lr_scheduler": lr_scheduler.__class__.__name__,
+                    "scheduler_gamma": 0.95,
+                    "model_name": model.__class__.__name__,
+                    "train_size": len(train_dataloader.dataset),
+                    "val_size": len(val_dataloader.dataset),
+                    "train_batch_size": train_dataloader.batch_size,
+                    "device": device,
+                }
+            )
 
-                losses = sum(loss for loss in loss_dict.values())
-                print(f"Losses: {losses}")
-                print(f"Loss Dict: {loss_dict}")
-            train_loss += losses.item()
-            optimizer.zero_grad()
-            scaler.scale(losses).backward()
-            scaler.step(optimizer)
-            scaler.update()
-        lr_scheduler.step()  # TODO: adjust scheduler
+        print("Starting the training...")
 
-        print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
-
-        model.eval()
-        with torch.no_grad():
+        scaler = torch.cuda.amp.GradScaler()
+        for epoch in tqdm(range(num_epochs), desc="Epochs"):
+            model.train()
+            train_loss = 0
+            loss_dict = {}
             for images, targets in tqdm(
-                val_dataloader, desc="Validation", leave=True, colour="GREEN"
+                train_dataloader, desc="Training", leave=True, colour="BLUE"
             ):
                 images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                predictions = model(images)
+                found_invalid_box = False
+                # check if the targets(bounding boxes) are smaller than the image size and have the correct format (positive width and height)
+                for target in targets:
+                    for box in target["boxes"]:
+                        if box[2] <= box[0] or box[3] <= box[1]:
+                            found_invalid_box = True
+                            print(f"Invalid Box found in training with {box}")
+                        if (
+                            box[2] > images[0].shape[-1]
+                            or box[3] > images[0].shape[-2]
+                        ):
+                            found_invalid_box = True
+                            print(f"Box outside of image found in training with {box}")
+                    if found_invalid_box:
+                        print(f"Image: {tensor_to_string(target['filename'])}")
+                        warnings.warn("Invalid box found in training data")
+                if found_invalid_box:
+                    continue
 
-                filtered_predictions = []
-                filtered_targets = []
+                # Apply mixed precision training
+                with torch.cuda.amp.autocast():
+                    # when training the fasterrcnn model, the model returns a dict with losses.
+                    # include class weights in the losses to balance the classes
+                    loss_dict = model(images, targets)
 
-                # check if image gets predictions and plot
-                for img, target, pred in zip(images, targets, predictions):
-                    if len(target["boxes"]) > 0:
-                        # plot_img_bbox(
-                        #     img,
-                        #     target,
-                        #     pred,
-                        #     f"Image {tensor_to_string(target['filename'])}",
-                        # )
-                        filtered_predictions.append(pred)
-                        filtered_targets.append(target)
-                    elif (len(pred["boxes"]) == 0) and (len(target["boxes"]) == 0):
-                        # append 1-pixel boxes
-                        filtered_predictions.append(
-                            {
-                                "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
-                                "scores": torch.tensor([1.]).to(device),
-                                "labels": torch.tensor([0]).to(device),
-                            }
-                        )
-                        filtered_targets.append(
-                            {
-                                "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
-                                "scores": torch.tensor([1.]).to(device),
-                                "labels": torch.tensor([0]).to(device),
-                            }
-                        )
+                    losses = sum(loss for loss in loss_dict.values())
+                    print(f"Losses: {losses}")
+                    print(f"Loss Dict: {loss_dict}")
+                train_loss += losses.item()
+                optimizer.zero_grad()
+                scaler.scale(losses).backward()
+                scaler.step(optimizer)
+                scaler.update()
+            lr_scheduler.step()  # TODO: adjust scheduler
 
-                # Calculate metrics
-                # if len(filtered_predictions) > 0:
-                metric.update(filtered_predictions, filtered_targets)
-                #     print(f"Filtered Outputs: {filtered_predictions}")
-                #     print(f"Filtered Targets: {filtered_targets}")
+            print(f"Epoch [{epoch+1}/{num_epochs}], Train Loss: {train_loss:.4f}")
 
-        # Calculate and print the mAP
-        map_metric = metric.compute()
-        print(f"Epoch [{epoch+1}/{num_epochs}], Val mAP: {map_metric['map']:.4f}")
-        print(map_metric)
+            train_losses.append(train_loss)
 
-        # Reset the metric for the next epoch
-        metric.reset()
+            model.eval()
+            with torch.no_grad():
+                for images, targets in tqdm(
+                    val_dataloader, desc="Validation", leave=True, colour="GREEN"
+                ):
+                    images = [image.to(device) for image in images]
+                    targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    predictions = model(images)
+
+                    filtered_predictions = []
+                    filtered_targets = []
+
+                    # check if image gets predictions and plot
+                    for img, target, pred in zip(images, targets, predictions):
+                        if len(target["boxes"]) > 0:
+                            # plot_img_bbox(
+                            #     img,
+                            #     target,
+                            #     pred,
+                            #     f"Image {tensor_to_string(target['filename'])}",
+                            # )
+                            filtered_predictions.append(pred)
+                            filtered_targets.append(target)
+                        elif (len(pred["boxes"]) == 0) and (len(target["boxes"]) == 0):
+                            # append 1-pixel boxes
+                            filtered_predictions.append(
+                                {
+                                    "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
+                                    "scores": torch.tensor([1.0]).to(device),
+                                    "labels": torch.tensor([0]).to(device),
+                                }
+                            )
+                            filtered_targets.append(
+                                {
+                                    "boxes": torch.tensor([[0, 0, 1, 1]]).to(device),
+                                    "scores": torch.tensor([1.0]).to(device),
+                                    "labels": torch.tensor([0]).to(device),
+                                }
+                            )
+
+                    # Calculate metrics
+                    # if len(filtered_predictions) > 0:
+                    metric.update(filtered_predictions, filtered_targets)
+                    #     print(f"Filtered Outputs: {filtered_predictions}")
+                    #     print(f"Filtered Targets: {filtered_targets}")
+
+            # Calculate and print the mAP
+            map_metric = metric.compute()
+            map_value = (
+                map_metric["map"].item()
+                if isinstance(map_metric["map"], torch.Tensor)
+                else float(map_metric["map"])
+            )
+            map_history.append(map_value)
+            print(f"Epoch [{epoch+1}/{num_epochs}], Val mAP: {map_value:.4f}")
+            print(map_metric)
+
+            if log_with_mlflow:
+                mlflow.log_metric("train_loss", train_loss, step=epoch + 1)
+                mlflow.log_metric("val_map", map_value, step=epoch + 1)
+                mlflow.log_metric(
+                    "learning_rate", optimizer.param_groups[0]["lr"], step=epoch + 1
+                )
+                for key, value in map_metric.items():
+                    if key == "map":
+                        continue
+                    metric_value = (
+                        value.item() if isinstance(value, torch.Tensor) else float(value)
+                    )
+                    mlflow.log_metric(f"val_{key}", metric_value, step=epoch + 1)
+
+            # Reset the metric for the next epoch
+            metric.reset()
+        if log_with_mlflow:
+            mlflow.pytorch.log_model(model, "model")
     print("Finished Training!")
-
-
-# --------------- Main ------------------
-
-dataloaders, class_names, num_classes = load_and_augment_images(
-    pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
-)
-train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 5)
+    return model, train_losses, map_history
 
 
 def evaluate_and_create_csv(model, test_dataloader, device):
@@ -729,4 +809,14 @@ def evaluate_and_create_csv(model, test_dataloader, device):
             f.write(f"{result}\n")
 
 
-evaluate_and_create_csv(model, dataloaders["inference"], get_device())
+def main():
+    dataloaders, _, num_classes = load_and_augment_images(
+        pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
+    )
+    model = build_fasterrcnn_model(num_classes=num_classes)
+    model, _, _ = train_and_evaluate(model, dataloaders["train"], dataloaders["test"], 5)
+    evaluate_and_create_csv(model, dataloaders["inference"], get_device())
+
+
+if __name__ == "__main__":
+    main()

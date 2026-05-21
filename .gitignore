@@ -1,7 +1,10 @@
 /CV.code-workspace
+__pycache__
+*.egg-info
 data/
 slides/
 src/cVlpYpp2byuSkcYHgUeF68Hm7t10n6QM,Pleural.csv
 amia/
+mlruns/
 openvino/
 *.pt

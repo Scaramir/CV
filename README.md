@@ -27,3 +27,22 @@ conda env create -f environment.yaml -n amia
 conda activate amia
 uv pip install -e .
 ```
+
+## Experiment tracking (MLflow)
+Start the MLflow UI from the repo root:
+```bash
+mlflow ui
+```
+Runs are stored in `mlruns/` (gitignored).
+
+## Smoke training runs
+Run short 2-epoch trainings for Faster R-CNN and RetinaNet:
+```bash
+python src\smoke_train.py --epochs 2
+```
+
+## Optuna hyperparameter search
+Kick off an Optuna study for Faster R-CNN:
+```bash
+python src\optuna_search.py --trials 100
+```

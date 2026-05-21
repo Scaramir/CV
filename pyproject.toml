@@ -19,7 +19,9 @@ dependencies = [
     "numpy",
     "matplotlib",
     "seaborn",
-    "jupyterlab"
+    "jupyterlab",
+    "mlflow>=2.0",
+    "optuna>=3.0"
 ]
 
 [[tool.uv.index]]
