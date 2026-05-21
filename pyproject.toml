@@ -1,0 +1,43 @@
+[project]
+name = "amia"
+version = "0.1.0"
+description = "A Python package for the AMIA 2026 challenge."
+readme = "README.md"
+authors = [
+    { name = "Maximilian Otto", email = "max.otto@fu-berlin.de" },
+    ]
+dependencies = [
+    "black>=26.5.1",
+    "torch",
+    "torchvision",
+    "torchaudio",
+    "torcheval",
+    "torchxrayvision",
+    "datasets",
+    "scikit-learn",
+    "pandas",
+    "numpy",
+    "matplotlib",
+    "seaborn",
+    "jupyterlab"
+]
+
+[[tool.uv.index]]
+# HPC runs has driver support until CUDA Version: 12.7, 
+# Use the latest compatible PyTorch version for this driver until we can upgrade to CUDA 13.2
+# 12.8 is deprecated since 13.0, so we cannot reliably use the dev-module with it. 
+name = "pytorch-cu126"
+url = "https://download.pytorch.org/whl/cu126"
+explicit = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu126" }
+torchvision = { index = "pytorch-cu126" }
+
+[tool.pytest.ini_options]
+# restrict pytest to our python source tree; ignores data folders
+testpaths = ["src"]
+pythonpath = ["."]
+python_files = "test_*.py"
+python_classes = "Test*"
+python_functions = "test_*"

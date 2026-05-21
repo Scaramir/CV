@@ -9,3 +9,21 @@ We trained FasterRCNN and RetinaNet with different hyperparameters to find the b
 
 A full report on how we tackled this project can be found [here](reports/CV_Lukassen_AMIA24_MO.pdf) (Max' report).  
 Alternatively, an HTML version of the project report can be found [here](https://www.notion.so/floherzler/AMIA-Kaggle-Challenge-2024-51cf2f6466b3486eb70e3928f64acf56?pvs=4#7d12f74f9f1446a2b4bb931e576fa4c3) (Flo's report).
+
+
+## Repository structure
+- `data/`: contains the dataset and the preprocessed data
+- `amia/`: contains figures and plots
+- `src/`: contains the code for dataset exploration, preprocessing, training
+- `runs/`: contains the trained models and their logs
+- `reports/`: contains the project report in PDF format
+
+## Usage
+Use this for installation and execution of the code.
+```bash 
+# clone the repository first
+# navigate to the repository
+conda env create -f environment.yaml -n amia
+conda activate amia
+uv pip install -e .
+```

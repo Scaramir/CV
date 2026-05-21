@@ -1,0 +1,10 @@
+# conda yaml file for setting up the environment
+name: amia
+channels:
+  - conda-forge
+  - nvidia
+dependencies:
+  - python=3.13
+  - uv 
+  - isort>=8.0.1
+  - pv>=1.6.6
