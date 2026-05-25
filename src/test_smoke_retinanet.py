@@ -39,5 +39,6 @@ def test_smoke_retinanet():
         val_limit=2,
         log_with_mlflow=False,
         use_amp=False,
+        auto_scale_batch_size=False,
     )
     run_training(config)

@@ -1,10 +1,13 @@
 import argparse
+import copy
 import json
 import shutil
 from pathlib import Path
 
+import mlflow
 import optuna
 import torch
+import yaml
 
 from amia import (
     AugmentationConfig,
@@ -15,6 +18,7 @@ from amia import (
     config_to_dict,
     normalize_config,
     run_training,
+    setup_mlflow,
     train_and_evaluate,
     train_yolo11,
 )
@@ -67,7 +71,11 @@ def build_trial_config(
     weight_decay = trial.suggest_float("weight_decay", 1e-6, 3e-3, log=True)
     scheduler_gamma = trial.suggest_float("scheduler_gamma", 0.9, 0.99)
     num_epochs = trial.suggest_int("num_epochs", 1, 6)
+    label_merge_nms_iou_thresh = trial.suggest_float(
+        "label_merge_nms_iou_thresh", 0.3, 0.7
+    )
     rpn_nms_thresh = trial.suggest_float("rpn_nms_thresh", 0.3, 0.7)
+    box_nms_thresh = trial.suggest_float("box_nms_thresh", 0.3, 0.7)
     box_score_thresh = trial.suggest_float("box_score_thresh", 0.05, 0.3)
     optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adamax", "sgd"])
     scheduler_name = trial.suggest_categorical(
@@ -88,7 +96,9 @@ def build_trial_config(
         warmup_epochs=warmup_epochs,
         use_ema=use_ema,
         ema_decay=ema_decay,
+        label_merge_nms_iou_thresh=label_merge_nms_iou_thresh,
         rpn_nms_thresh=rpn_nms_thresh,
+        box_nms_thresh=box_nms_thresh,
         box_score_thresh=box_score_thresh,
         experiment_name=f"amia-optuna-{model_type}",
         run_name=f"trial-{trial.number}",
@@ -96,10 +106,14 @@ def build_trial_config(
         seed=seed,
         train_limit=train_limit,
         val_limit=val_limit,
+        auto_scale_batch_size=False,
     )
     config.augmentations = suggest_augmentations(trial)
 
     if model_type == "yolo11":
+        config.yolo_conf_thresh = trial.suggest_float("yolo_conf_thresh", 0.001, 0.2)
+        config.yolo_iou_thresh = trial.suggest_float("yolo_iou_thresh", 0.3, 0.8)
+        config.yolo_auto_batch = False
         config.yolo_mosaic = trial.suggest_float("yolo_mosaic", 0.0, 1.0)
         config.yolo_mixup = trial.suggest_float("yolo_mixup", 0.0, 0.2)
         config.yolo_copy_paste = trial.suggest_float("yolo_copy_paste", 0.0, 0.2)
@@ -136,19 +150,46 @@ def save_best_trial(
         "params": params,
         "config": config_to_dict(config),
     }
-    (checkpoint_dir / f"best_{model_type}.json").write_text(
-        json.dumps(meta, indent=2)
-    )
+    json_path = checkpoint_dir / f"best_{model_type}.json"
+    yaml_path = checkpoint_dir / f"best_{model_type}.yaml"
+    json_path.write_text(json.dumps(meta, indent=2))
+    yaml_path.write_text(yaml.safe_dump(meta, sort_keys=False))
 
+    checkpoint_path = None
     if model_type in ("fasterrcnn", "retinanet"):
-        torch.save(model.state_dict(), checkpoint_dir / f"best_{model_type}.pt")
-        return
+        checkpoint_path = checkpoint_dir / f"best_{model_type}.pt"
+        torch.save(model.state_dict(), checkpoint_path)
+    else:
+        save_dir = getattr(getattr(model, "trainer", None), "save_dir", None)
+        if save_dir:
+            best_weights = Path(save_dir) / "weights" / "best.pt"
+            if best_weights.exists():
+                checkpoint_path = checkpoint_dir / f"best_{model_type}.pt"
+                shutil.copy2(best_weights, checkpoint_path)
 
-    save_dir = getattr(getattr(model, "trainer", None), "save_dir", None)
-    if save_dir:
-        best_weights = Path(save_dir) / "weights" / "best.pt"
-        if best_weights.exists():
-            shutil.copy2(best_weights, checkpoint_dir / f"best_{model_type}.pt")
+    log_best_to_mlflow(model_type, meta, json_path, yaml_path, checkpoint_path, config)
+
+
+def log_best_to_mlflow(
+    model_type: str,
+    meta: dict,
+    json_path: Path,
+    yaml_path: Path,
+    checkpoint_path: Path | None,
+    config: TrainingConfig,
+):
+    mlflow_config = copy.copy(config)
+    mlflow_config.experiment_name = "amia-optuna-best"
+    mlflow_config.run_name = f"best-{model_type}"
+    mlflow_config.log_with_mlflow = True
+    setup_mlflow(mlflow_config)
+    with mlflow.start_run(run_name=mlflow_config.run_name):
+        mlflow.log_metric("best_value", meta["best_value"])
+        mlflow.log_params(meta["params"])
+        mlflow.log_artifact(str(json_path), artifact_path="best_config")
+        mlflow.log_artifact(str(yaml_path), artifact_path="best_config")
+        if checkpoint_path and checkpoint_path.exists():
+            mlflow.log_artifact(str(checkpoint_path), artifact_path="best_model")
 
 
 def build_pruner(
@@ -198,6 +239,7 @@ def objective(
         model = build_fasterrcnn_model(
             num_classes=num_classes,
             rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
         _, _, map_history = train_and_evaluate(
@@ -218,7 +260,7 @@ def objective(
     if model_type == "retinanet":
         model = build_retinanet_model(
             num_classes=num_classes,
-            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
         _, _, map_history = train_and_evaluate(

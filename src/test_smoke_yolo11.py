@@ -39,6 +39,8 @@ def test_smoke_yolo11():
         val_limit=2,
         log_with_mlflow=False,
         use_amp=False,
+        auto_scale_batch_size=False,
+        yolo_auto_batch=False,
         yolo_imgsz=320,
         yolo_rebuild_dataset=True,
         yolo_mosaic=0.0,

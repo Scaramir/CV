@@ -164,6 +164,7 @@ class TrainingConfig:
     image_size: int = 448
     label_merge_nms_iou_thresh: float = 0.5
     rpn_nms_thresh: float = 0.5
+    box_nms_thresh: float = 0.5
     box_score_thresh: float = 0.1
     train_split: float = 0.8
     seed: int = 123420
@@ -182,9 +183,9 @@ class TrainingConfig:
     augmentations: AugmentationConfig = field(default_factory=AugmentationConfig)
     use_amp: bool = True
     amp_dtype: str = "fp16"
-    grad_clip_norm: float | None = None
+    grad_clip_norm: float | None = 10.0
     grad_accum_steps: int = 1
-    use_ema: bool = False
+    use_ema: bool = True
     ema_decay: float = 0.9998
     matmul_precision: str = "high"
     allow_tf32: bool = True
@@ -192,7 +193,7 @@ class TrainingConfig:
     enable_cudnn_benchmark: bool = False
     use_channels_last: bool = False
     use_compile: bool = False
-    auto_scale_batch_size: bool = False
+    auto_scale_batch_size: bool = True
     auto_scale_mode: str = "binsearch"
     auto_scale_steps_per_trial: int = 3
     auto_scale_max_trials: int = 10
@@ -200,6 +201,7 @@ class TrainingConfig:
     yolo_imgsz: int = 640
     yolo_dataset_root: Path = REPO_ROOT / "data" / "yolo11"
     yolo_rebuild_dataset: bool = False
+    yolo_auto_batch: bool = True
     yolo_mosaic: float = 0.5
     yolo_mixup: float = 0.1
     yolo_copy_paste: float = 0.0
@@ -213,6 +215,9 @@ class TrainingConfig:
     yolo_shear: float = 0.0
     yolo_perspective: float = 0.0
     yolo_erasing: float = 0.0
+    yolo_conf_thresh: float = 0.01
+    yolo_iou_thresh: float = 0.7
+    yolo_warmup_epochs: float = 1.0
 
 
 # --------------- Helper functions ------------------
@@ -919,7 +924,7 @@ def build_backbone_with_fpn():
 
 
 def build_fasterrcnn_model(
-    num_classes=15, rpn_nms_thresh=0.5, box_score_thresh=0.1
+    num_classes=15, rpn_nms_thresh=0.5, box_nms_thresh=0.5, box_score_thresh=0.1
 ):
     anchor_generator = build_anchor_generator()
     backbone_with_fpn = build_backbone_with_fpn()
@@ -943,6 +948,7 @@ def build_fasterrcnn_model(
         # rpn_post_nms_top_n_train=2000,
         # rpn_post_nms_top_n_test=1000,
         rpn_nms_thresh=rpn_nms_thresh,  # lower NMS -> fewer proposals
+        box_nms_thresh=box_nms_thresh,
         box_score_thresh=box_score_thresh,  # increase to filter low-confidence detections
         box_detections_per_img=50,  # default 100 -> overkill?
     )
@@ -950,7 +956,7 @@ def build_fasterrcnn_model(
 
 
 def build_retinanet_model(
-    num_classes=15, rpn_nms_thresh=0.5, box_score_thresh=0.1
+    num_classes=15, box_nms_thresh=0.5, box_score_thresh=0.1
 ):
     anchor_generator = build_anchor_generator()
     backbone_with_fpn = build_backbone_with_fpn()
@@ -961,7 +967,7 @@ def build_retinanet_model(
         image_mean=[0],
         image_std=[1],
         score_thresh=box_score_thresh,
-        nms_thresh=rpn_nms_thresh,
+        nms_thresh=box_nms_thresh,
         detections_per_img=50,
     )
     return model
@@ -1101,11 +1107,12 @@ def train_yolo11(config: TrainingConfig, train_ids, val_ids):
             mlflow.log_dict(config_to_dict(config), "config.json")
             mlflow.log_artifact(str(dataset_yaml), artifact_path="data")
 
+        yolo_batch = -1 if config.yolo_auto_batch else config.batch_size
         results = model.train(
             data=str(dataset_yaml),
             imgsz=config.yolo_imgsz,
             epochs=config.epochs,
-            batch=config.batch_size,
+            batch=yolo_batch,
             lr0=config.lr,
             weight_decay=config.weight_decay,
             amp=config.use_amp,
@@ -1126,6 +1133,9 @@ def train_yolo11(config: TrainingConfig, train_ids, val_ids):
             shear=config.yolo_shear,
             perspective=config.yolo_perspective,
             erasing=config.yolo_erasing,
+            conf=config.yolo_conf_thresh,
+            iou=config.yolo_iou_thresh,
+            warmup_epochs=config.yolo_warmup_epochs,
             project=str(REPO_ROOT / "runs"),
             name=config.run_name or "yolo11",
             exist_ok=True,
@@ -1258,13 +1268,14 @@ def find_optimal_batch_size(
     if config.model_type == "retinanet":
         base_model = build_retinanet_model(
             num_classes=num_classes,
-            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
     else:
         base_model = build_fasterrcnn_model(
             num_classes=num_classes,
             rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
 
@@ -1472,6 +1483,7 @@ def train_and_evaluate(
                     "dataset_version": config.dataset_root.name,
                     "label_merge_nms_iou_thresh": config.label_merge_nms_iou_thresh,
                     "rpn_nms_thresh": config.rpn_nms_thresh,
+                    "box_nms_thresh": config.box_nms_thresh,
                     "box_score_thresh": config.box_score_thresh,
                     "image_size": config.image_size,
                     "train_split": config.train_split,
@@ -1802,13 +1814,14 @@ def run_training(config: TrainingConfig):
     if config.model_type == "retinanet":
         model = build_retinanet_model(
             num_classes=num_classes,
-            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
     else:
         model = build_fasterrcnn_model(
             num_classes=num_classes,
             rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
             box_score_thresh=config.box_score_thresh,
         )
 
@@ -1861,7 +1874,8 @@ def parse_args():
     parser.add_argument("--cudnn-benchmark", action="store_true")
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--compile", action="store_true")
-    parser.add_argument("--auto-batch-size", action="store_true")
+    parser.add_argument("--no-auto-batch-size", dest="auto_batch_size", action="store_false")
+    parser.set_defaults(auto_batch_size=True)
     parser.add_argument(
         "--auto-batch-size-mode", choices=["binsearch", "power"], default="binsearch"
     )
@@ -1869,6 +1883,7 @@ def parse_args():
     parser.add_argument("--auto-batch-size-max-trials", type=int, default=10)
     parser.add_argument("--label-merge-nms-iou-thresh", type=float, default=0.5)
     parser.add_argument("--rpn-nms-thresh", type=float, default=0.5)
+    parser.add_argument("--box-nms-thresh", type=float, default=0.5)
     parser.add_argument("--box-score-thresh", type=float, default=0.1)
     parser.add_argument("--train-split", type=float, default=0.8)
     parser.add_argument("--seed", type=int, default=123420)
@@ -1885,6 +1900,11 @@ def parse_args():
     parser.add_argument("--yolo-imgsz", type=int, default=640)
     parser.add_argument("--yolo-dataset-root", type=Path, default=REPO_ROOT / "data" / "yolo11")
     parser.add_argument("--yolo-rebuild-dataset", action="store_true")
+    parser.add_argument("--yolo-no-auto-batch", dest="yolo_auto_batch", action="store_false")
+    parser.set_defaults(yolo_auto_batch=True)
+    parser.add_argument("--yolo-conf-thresh", type=float, default=0.01)
+    parser.add_argument("--yolo-iou-thresh", type=float, default=0.7)
+    parser.add_argument("--yolo-warmup-epochs", type=float, default=1.0)
     parser.add_argument("--yolo-mosaic", type=float, default=0.5)
     parser.add_argument("--yolo-mixup", type=float, default=0.1)
     parser.add_argument("--yolo-copy-paste", type=float, default=0.0)
@@ -1939,6 +1959,7 @@ def main():
         auto_scale_max_trials=args.auto_batch_size_max_trials,
         label_merge_nms_iou_thresh=args.label_merge_nms_iou_thresh,
         rpn_nms_thresh=args.rpn_nms_thresh,
+        box_nms_thresh=args.box_nms_thresh,
         box_score_thresh=args.box_score_thresh,
         train_split=args.train_split,
         seed=args.seed,
@@ -1955,6 +1976,10 @@ def main():
         yolo_imgsz=args.yolo_imgsz,
         yolo_dataset_root=args.yolo_dataset_root,
         yolo_rebuild_dataset=args.yolo_rebuild_dataset,
+        yolo_auto_batch=args.yolo_auto_batch,
+        yolo_conf_thresh=args.yolo_conf_thresh,
+        yolo_iou_thresh=args.yolo_iou_thresh,
+        yolo_warmup_epochs=args.yolo_warmup_epochs,
         yolo_mosaic=args.yolo_mosaic,
         yolo_mixup=args.yolo_mixup,
         yolo_copy_paste=args.yolo_copy_paste,
