@@ -1,10 +1,12 @@
 import argparse
 import contextlib
 import copy
+import math
 import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
+from typing import Callable
 from pathlib import Path
 from tqdm.autonotebook import tqdm as tqdm
 import torch
@@ -13,6 +15,7 @@ from torch.utils.data import Dataset
 from torchvision import datasets, transforms, tv_tensors
 from torchvision.io import read_image
 from torchvision.transforms import v2
+from torchvision.transforms.v2 import functional as F2
 
 # import medmnist
 # from medmnist import ChestMNIST, DermaMNIST, INFO, Evaluator
@@ -114,6 +117,9 @@ else:  # Linux and others
 
 @dataclass
 class AugmentationConfig:
+    random_resized_crop_p: float = 0.0
+    random_resized_crop_scale: tuple[float, float] = (0.9, 1.0)
+    random_resized_crop_ratio: tuple[float, float] = (0.9, 1.1)
     rotation_deg: float = 6.0
     translate: float = 0.02
     scale: float = 0.05
@@ -123,6 +129,8 @@ class AugmentationConfig:
     brightness: float = 0.1
     contrast: float = 0.1
     color_jitter_p: float = 1.0
+    gamma_p: float = 0.0
+    gamma_range: tuple[float, float] = (0.9, 1.1)
     sharpness_factor: float = 1.5
     sharpness_p: float = 0.1
     autocontrast_p: float = 0.1
@@ -130,6 +138,8 @@ class AugmentationConfig:
     gaussian_blur_p: float = 0.05
     gaussian_blur_kernel: int = 3
     gaussian_blur_sigma: tuple[float, float] = (0.1, 1.0)
+    gaussian_noise_p: float = 0.0
+    gaussian_noise_std_range: tuple[float, float] = (0.005, 0.02)
     random_erasing_p: float = 0.1
     random_erasing_scale: tuple[float, float] = (0.02, 0.08)
     random_erasing_ratio: tuple[float, float] = (0.3, 3.3)
@@ -139,11 +149,18 @@ class AugmentationConfig:
 @dataclass
 class TrainingConfig:
     model_type: str = "fasterrcnn"
-    epochs: int = 30
+    epochs: int = 50
     batch_size: int = 24
     lr: float = 0.0005
     weight_decay: float = 0.0005
     scheduler_gamma: float = 0.95
+    optimizer_name: str = "adamw"
+    scheduler_name: str = "cosine"
+    warmup_epochs: int = 1
+    warmup_start_factor: float = 0.1
+    onecycle_pct_start: float = 0.3
+    onecycle_div_factor: float = 25.0
+    onecycle_final_div_factor: float = 1e4
     image_size: int = 448
     label_merge_nms_iou_thresh: float = 0.5
     rpn_nms_thresh: float = 0.5
@@ -175,6 +192,10 @@ class TrainingConfig:
     enable_cudnn_benchmark: bool = False
     use_channels_last: bool = False
     use_compile: bool = False
+    auto_scale_batch_size: bool = False
+    auto_scale_mode: str = "binsearch"
+    auto_scale_steps_per_trial: int = 3
+    auto_scale_max_trials: int = 10
     yolo_model: str = "yolo11s.pt"
     yolo_imgsz: int = 640
     yolo_dataset_root: Path = REPO_ROOT / "data" / "yolo11"
@@ -531,13 +552,85 @@ class XRayImageDataset(Dataset):
         return image, target
 
 
+class RandomGamma(v2.Transform):
+    def __init__(
+        self, gamma_range: tuple[float, float] = (0.9, 1.1), p: float = 0.1
+    ):
+        super().__init__()
+        self.gamma_range = gamma_range
+        self.p = p
+
+    def transform(self, inpt, params):
+        if isinstance(inpt, tv_tensors.BoundingBoxes):
+            return inpt
+        if torch.is_tensor(inpt):
+            do = params.get("do") if params else None
+            if do is None:
+                do = float(torch.rand(1)) < self.p
+            if not do:
+                return inpt
+            gamma = params.get("gamma") if params else None
+            if gamma is None:
+                gamma = float(
+                    torch.empty(1).uniform_(self.gamma_range[0], self.gamma_range[1])
+                )
+            return F2.adjust_gamma(inpt, gamma)
+        return inpt
+
+
+class RandomGaussianNoise(v2.Transform):
+    def __init__(
+        self,
+        std_range: tuple[float, float] = (0.005, 0.02),
+        p: float = 0.1,
+    ):
+        super().__init__()
+        self.std_range = std_range
+        self.p = p
+
+    def transform(self, inpt, params):
+        if isinstance(inpt, tv_tensors.BoundingBoxes):
+            return inpt
+        if torch.is_tensor(inpt):
+            do = params.get("do") if params else None
+            if do is None:
+                do = float(torch.rand(1)) < self.p
+            if not do:
+                return inpt
+            std = params.get("std") if params else None
+            if std is None:
+                std = float(
+                    torch.empty(1).uniform_(self.std_range[0], self.std_range[1])
+                )
+            noise = torch.randn_like(inpt) * std
+            return torch.clamp(inpt + noise, 0.0, 1.0)
+        return inpt
+
+
 def build_xray_transforms(
     img_size: int, mean: float, std: float, augmentations: AugmentationConfig | None
 ):
     aug = augmentations or AugmentationConfig()
 
-    train_transforms: list = [
-        v2.Resize(img_size, antialias=True),
+    if aug.random_resized_crop_p > 0:
+        train_transforms: list = [
+            v2.RandomApply(
+                [
+                    v2.RandomResizedCrop(
+                        img_size,
+                        scale=aug.random_resized_crop_scale,
+                        ratio=aug.random_resized_crop_ratio,
+                        antialias=True,
+                    )
+                ],
+                p=aug.random_resized_crop_p,
+            ),
+            v2.Resize(img_size, antialias=True),
+        ]
+    else:
+        train_transforms = [v2.Resize(img_size, antialias=True)]
+
+    train_transforms += [
         v2.Grayscale(num_output_channels=1),
         v2.ToDtype(torch.float32, scale=True),
     ]
@@ -573,6 +666,10 @@ def build_xray_transforms(
                 p=aug.color_jitter_p,
             )
         )
+    if aug.gamma_p > 0:
+        train_transforms.append(
+            RandomGamma(gamma_range=aug.gamma_range, p=aug.gamma_p)
+        )
     if aug.autocontrast_p > 0:
         train_transforms.append(v2.RandomAutocontrast(p=aug.autocontrast_p))
     if aug.equalize_p > 0:
@@ -593,6 +690,12 @@ def build_xray_transforms(
                     )
                 ],
                 p=aug.gaussian_blur_p,
+            )
+        )
+    if aug.gaussian_noise_p > 0:
+        train_transforms.append(
+            RandomGaussianNoise(
+                std_range=aug.gaussian_noise_std_range, p=aug.gaussian_noise_p
             )
         )
     if aug.random_erasing_p > 0:
@@ -1094,6 +1197,102 @@ class ModelEMA:
                     continue
                 ema_state[key].mul_(self.decay).add_(value, alpha=1.0 - self.decay)
 
+
+def find_optimal_batch_size(
+    config: TrainingConfig, num_classes: int, train_dataset: Dataset
+) -> int:
+    try:
+        import lightning.pytorch as pl
+        from lightning.pytorch.tuner import Tuner
+    except ImportError as exc:
+        raise ImportError(
+            "Auto batch size finding requires lightning. Install it with `uv pip install lightning`."
+        ) from exc
+
+    class BatchSizeDataModule(pl.LightningDataModule):
+        def __init__(self, dataset: Dataset, batch_size: int):
+            super().__init__()
+            self.dataset = dataset
+            self.batch_size = batch_size
+
+        def train_dataloader(self):
+            return DataLoader(
+                self.dataset,
+                batch_size=self.batch_size,
+                shuffle=True,
+                num_workers=num_workers,
+                collate_fn=collate_fn,
+            )
+
+    class BatchSizeFinderModule(pl.LightningModule):
+        def __init__(self, model: nn.Module, optimizer_name: str, lr: float, weight_decay: float):
+            super().__init__()
+            self.model = model
+            self.optimizer_name = optimizer_name
+            self.lr = lr
+            self.weight_decay = weight_decay
+
+        def training_step(self, batch, batch_idx):
+            images, targets = batch
+            loss_dict = self.model(images, targets)
+            return sum(loss for loss in loss_dict.values())
+
+        def configure_optimizers(self):
+            if self.optimizer_name == "adamw":
+                return torch.optim.AdamW(
+                    self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                )
+            if self.optimizer_name == "adamax":
+                return torch.optim.Adamax(
+                    self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                )
+            if self.optimizer_name == "sgd":
+                return torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=self.lr,
+                    momentum=0.9,
+                    weight_decay=self.weight_decay,
+                )
+            raise ValueError(f"Unsupported optimizer: {self.optimizer_name}")
+
+    if config.model_type == "retinanet":
+        base_model = build_retinanet_model(
+            num_classes=num_classes,
+            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_score_thresh=config.box_score_thresh,
+        )
+    else:
+        base_model = build_fasterrcnn_model(
+            num_classes=num_classes,
+            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_score_thresh=config.box_score_thresh,
+        )
+
+    lightning_model = BatchSizeFinderModule(
+        base_model, config.optimizer_name.lower(), config.lr, config.weight_decay
+    )
+    data_module = BatchSizeDataModule(train_dataset, config.batch_size)
+
+    trainer = pl.Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        max_epochs=1,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+    tuner = Tuner(trainer)
+    tuner.scale_batch_size(
+        lightning_model,
+        train_dataloaders=data_module,
+        mode=config.auto_scale_mode,
+        init_val=config.batch_size,
+        steps_per_trial=config.auto_scale_steps_per_trial,
+        max_trials=config.auto_scale_max_trials,
+    )
+    return int(data_module.batch_size)
+
 # since we use fasterrcnn from torchvision, we can use the losses from the model
 # we need to adjust the losses to include class weights
 # overload the fastrcnn_loss function used by forward() to include class weights
@@ -1137,6 +1336,7 @@ def train_and_evaluate(
     config: TrainingConfig,
     train_ids=None,
     test_ids=None,
+    reporter: Callable[[int, float, float], None] | None = None,
 ):
     set_seeds(
         config.seed,
@@ -1154,19 +1354,71 @@ def train_and_evaluate(
     if config.use_compile and hasattr(torch, "compile"):
         model = torch.compile(model)
     params = [p for p in model.parameters() if p.requires_grad]
-    # optimizer = torch.optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
-    optimizer = torch.optim.Adamax(
-        params, lr=config.lr, weight_decay=config.weight_decay
-    )
-    # lr_scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=5, gamma=0.1)
-    lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
-        optimizer, gamma=config.scheduler_gamma
-    )  # let's try this one as well
+    optimizer_name = config.optimizer_name.lower()
+    if optimizer_name == "adamw":
+        optimizer = torch.optim.AdamW(
+            params, lr=config.lr, weight_decay=config.weight_decay
+        )
+    elif optimizer_name == "adamax":
+        optimizer = torch.optim.Adamax(
+            params, lr=config.lr, weight_decay=config.weight_decay
+        )
+    elif optimizer_name == "sgd":
+        optimizer = torch.optim.SGD(
+            params, lr=config.lr, momentum=0.9, weight_decay=config.weight_decay
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer: {config.optimizer_name}")
+
+    scheduler_name = config.scheduler_name.lower()
+    lr_scheduler = None
+    step_scheduler_per_batch = False
+    if scheduler_name == "cosine":
+        if config.warmup_epochs > 0:
+            warmup = torch.optim.lr_scheduler.LinearLR(
+                optimizer,
+                start_factor=config.warmup_start_factor,
+                total_iters=config.warmup_epochs,
+            )
+            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max(1, config.epochs - config.warmup_epochs),
+            )
+            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
+                optimizer, schedulers=[warmup, cosine], milestones=[config.warmup_epochs]
+            )
+        else:
+            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer, T_max=max(1, config.epochs)
+            )
+    elif scheduler_name == "onecycle":
+        steps_per_epoch = max(
+            1, math.ceil(len(train_dataloader) / max(1, config.grad_accum_steps))
+        )
+        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+            optimizer,
+            max_lr=config.lr,
+            epochs=config.epochs,
+            steps_per_epoch=steps_per_epoch,
+            pct_start=config.onecycle_pct_start,
+            div_factor=config.onecycle_div_factor,
+            final_div_factor=config.onecycle_final_div_factor,
+        )
+        step_scheduler_per_batch = True
+    elif scheduler_name == "exponential":
+        lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
+            optimizer, gamma=config.scheduler_gamma
+        )
+    elif scheduler_name == "none":
+        lr_scheduler = None
+    else:
+        raise ValueError(f"Unsupported scheduler: {config.scheduler_name}")
 
     # Initialize MeanAveragePrecision metric
     metric = MeanAveragePrecision(
         box_format="xyxy",
         iou_type="bbox",
+        class_metrics=True,
         # iou_thresholds=[0.1],#[0.1, 0.4, 0.7],
     )
 
@@ -1188,9 +1440,14 @@ def train_and_evaluate(
                     "num_epochs": config.epochs,
                     "learning_rate": config.lr,
                     "weight_decay": config.weight_decay,
-                    "optimizer": optimizer.__class__.__name__,
-                    "lr_scheduler": lr_scheduler.__class__.__name__,
+                    "optimizer": config.optimizer_name,
+                    "lr_scheduler": config.scheduler_name,
                     "scheduler_gamma": config.scheduler_gamma,
+                    "warmup_epochs": config.warmup_epochs,
+                    "warmup_start_factor": config.warmup_start_factor,
+                    "onecycle_pct_start": config.onecycle_pct_start,
+                    "onecycle_div_factor": config.onecycle_div_factor,
+                    "onecycle_final_div_factor": config.onecycle_final_div_factor,
                     "model_name": model.__class__.__name__,
                     "train_size": len(train_dataloader.dataset),
                     "val_size": len(val_dataloader.dataset),
@@ -1208,6 +1465,10 @@ def train_and_evaluate(
                     "enable_cudnn_benchmark": config.enable_cudnn_benchmark,
                     "use_channels_last": config.use_channels_last,
                     "use_compile": config.use_compile,
+                    "auto_scale_batch_size": config.auto_scale_batch_size,
+                    "auto_scale_mode": config.auto_scale_mode,
+                    "auto_scale_steps_per_trial": config.auto_scale_steps_per_trial,
+                    "auto_scale_max_trials": config.auto_scale_max_trials,
                     "dataset_version": config.dataset_root.name,
                     "label_merge_nms_iou_thresh": config.label_merge_nms_iou_thresh,
                     "rpn_nms_thresh": config.rpn_nms_thresh,
@@ -1239,12 +1500,15 @@ def train_and_evaluate(
             train_loss = 0
             loss_dict = {}
             loss_sums: dict[str, float] = {}
+            epoch_start = time.perf_counter()
+            processed_images = 0
             accum_steps = max(1, config.grad_accum_steps)
             accum_counter = 0
             optimizer.zero_grad(set_to_none=True)
             for images, targets in tqdm(
                 train_dataloader, desc="Training", leave=True, colour="BLUE"
             ):
+                processed_images += len(images)
                 if config.use_channels_last and device == "cuda":
                     images = [
                         image.to(device, memory_format=torch.channels_last)
@@ -1301,6 +1565,8 @@ def train_and_evaluate(
                         scaler.update()
                     else:
                         optimizer.step()
+                    if lr_scheduler and step_scheduler_per_batch:
+                        lr_scheduler.step()
                     optimizer.zero_grad(set_to_none=True)
                     if ema:
                         ema.update(model)
@@ -1315,10 +1581,13 @@ def train_and_evaluate(
                     scaler.update()
                 else:
                     optimizer.step()
+                if lr_scheduler and step_scheduler_per_batch:
+                    lr_scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
                 if ema:
                     ema.update(model)
-            lr_scheduler.step()  # TODO: adjust scheduler
+            if lr_scheduler and not step_scheduler_per_batch:
+                lr_scheduler.step()
 
             avg_train_loss = train_loss / max(1, len(train_dataloader))
             print(
@@ -1326,6 +1595,12 @@ def train_and_evaluate(
             )
 
             train_losses.append(avg_train_loss)
+            epoch_time = max(1e-9, time.perf_counter() - epoch_start)
+            samples_per_sec = processed_images / epoch_time
+            if config.log_with_mlflow:
+                mlflow.log_metric(
+                    "train_samples_per_sec", samples_per_sec, step=epoch + 1
+                )
 
             model.eval()
             eval_model = ema.module if ema else model
@@ -1390,6 +1665,8 @@ def train_and_evaluate(
             map_history.append(map_value)
             print(f"Epoch [{epoch+1}/{config.epochs}], Val mAP: {map_value:.4f}")
             print(map_metric)
+            if reporter:
+                reporter(epoch, avg_train_loss, map_value)
 
             if config.log_with_mlflow:
                 mlflow.log_metric("train_loss", avg_train_loss, step=epoch + 1)
@@ -1405,6 +1682,19 @@ def train_and_evaluate(
                     )
                 for key, value in map_metric.items():
                     if key == "map":
+                        continue
+                    if key.endswith("_per_class") and isinstance(value, torch.Tensor):
+                        for idx, class_value in enumerate(value):
+                            class_name = class_names.get(idx, f"class_{idx}")
+                            metric_name = (
+                                f"val_{key}_{class_name.lower().replace(' ', '_').replace('/', '_')}"
+                            )
+                            metric_value = (
+                                class_value.item()
+                                if class_value.is_floating_point()
+                                else class_value.float().item()
+                            )
+                            mlflow.log_metric(metric_name, metric_value, step=epoch + 1)
                         continue
                     if isinstance(value, torch.Tensor):
                         value_tensor = (
@@ -1489,9 +1779,20 @@ def build_dataloaders_from_config(config: TrainingConfig):
 
 def run_training(config: TrainingConfig):
     config = normalize_config(config)
-    dataloaders, num_classes, train_ids, test_ids = build_dataloaders_from_config(
-        config
-    )
+    if config.auto_scale_batch_size and config.model_type != "yolo11":
+        dataloaders, num_classes, train_ids, test_ids = build_dataloaders_from_config(
+            config
+        )
+        config.batch_size = find_optimal_batch_size(
+            config, num_classes, dataloaders["train"].dataset
+        )
+        dataloaders, num_classes, train_ids, test_ids = build_dataloaders_from_config(
+            config
+        )
+    else:
+        dataloaders, num_classes, train_ids, test_ids = build_dataloaders_from_config(
+            config
+        )
 
     if config.model_type == "yolo11":
         model, train_losses, map_history, _ = train_yolo11(
@@ -1527,11 +1828,22 @@ def parse_args():
     parser.add_argument(
         "--model", choices=["fasterrcnn", "retinanet", "yolo11"], default="fasterrcnn"
     )
-    parser.add_argument("--epochs", type=int, default=30)
+    parser.add_argument("--epochs", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=24)
     parser.add_argument("--lr", type=float, default=0.0005)
     parser.add_argument("--weight-decay", type=float, default=0.0005)
     parser.add_argument("--scheduler-gamma", type=float, default=0.95)
+    parser.add_argument(
+        "--optimizer", choices=["adamw", "adamax", "sgd"], default="adamw"
+    )
+    parser.add_argument(
+        "--scheduler", choices=["cosine", "onecycle", "exponential", "none"], default="cosine"
+    )
+    parser.add_argument("--warmup-epochs", type=int, default=1)
+    parser.add_argument("--warmup-start-factor", type=float, default=0.1)
+    parser.add_argument("--onecycle-pct-start", type=float, default=0.3)
+    parser.add_argument("--onecycle-div-factor", type=float, default=25.0)
+    parser.add_argument("--onecycle-final-div-factor", type=float, default=1e4)
     parser.add_argument("--image-size", type=int, default=448)
     parser.add_argument("--amp-dtype", choices=["fp16", "bf16"], default="fp16")
     parser.add_argument("--no-amp", action="store_true")
@@ -1549,6 +1861,12 @@ def parse_args():
     parser.add_argument("--cudnn-benchmark", action="store_true")
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--compile", action="store_true")
+    parser.add_argument("--auto-batch-size", action="store_true")
+    parser.add_argument(
+        "--auto-batch-size-mode", choices=["binsearch", "power"], default="binsearch"
+    )
+    parser.add_argument("--auto-batch-size-steps", type=int, default=3)
+    parser.add_argument("--auto-batch-size-max-trials", type=int, default=10)
     parser.add_argument("--label-merge-nms-iou-thresh", type=float, default=0.5)
     parser.add_argument("--rpn-nms-thresh", type=float, default=0.5)
     parser.add_argument("--box-score-thresh", type=float, default=0.1)
@@ -1595,6 +1913,13 @@ def main():
         lr=args.lr,
         weight_decay=args.weight_decay,
         scheduler_gamma=args.scheduler_gamma,
+        optimizer_name=args.optimizer,
+        scheduler_name=args.scheduler,
+        warmup_epochs=args.warmup_epochs,
+        warmup_start_factor=args.warmup_start_factor,
+        onecycle_pct_start=args.onecycle_pct_start,
+        onecycle_div_factor=args.onecycle_div_factor,
+        onecycle_final_div_factor=args.onecycle_final_div_factor,
         image_size=args.image_size,
         use_amp=not args.no_amp,
         amp_dtype=args.amp_dtype,
@@ -1608,6 +1933,10 @@ def main():
         enable_cudnn_benchmark=args.cudnn_benchmark,
         use_channels_last=args.channels_last,
         use_compile=args.compile,
+        auto_scale_batch_size=args.auto_batch_size,
+        auto_scale_mode=args.auto_batch_size_mode,
+        auto_scale_steps_per_trial=args.auto_batch_size_steps,
+        auto_scale_max_trials=args.auto_batch_size_max_trials,
         label_merge_nms_iou_thresh=args.label_merge_nms_iou_thresh,
         rpn_nms_thresh=args.rpn_nms_thresh,
         box_score_thresh=args.box_score_thresh,

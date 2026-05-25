@@ -23,17 +23,31 @@ Use this for installation and execution of the code.
 ```bash 
 # clone the repository first
 # navigate to the repository
-conda env create -f environment.yaml -n amia
-conda activate amia
+micromamba create -f environment.yaml -n amia
+micromamba activate amia
 uv pip install -e .
 ```
 
 ## Experiment tracking (MLflow)
-Start the MLflow UI from the repo root:
+Launch the MLflow UI from the repo root:
 ```bash
 mlflow ui
 ```
-Runs are stored in `mlruns/` (gitignored).
+By default, runs are stored in `mlruns/` (gitignored) and metadata in `mlflow.db`.
+
+## Training entry point
+Run a training session from the repo root (uses 2026 data by default):
+```bash
+python src\amia.py --model fasterrcnn --epochs 2
+```
+Fine-tune YOLO11 (exports a YOLO dataset under `data\yolo11` on first run):
+```bash
+python src\amia.py --model yolo11 --epochs 50 --yolo-model yolo11s.pt --yolo-rebuild-dataset
+```
+To regenerate the image dictionary JSON from `train.csv` and `img_size.csv`:
+```bash
+python src\amia.py --rebuild-image-dict
+```
 
 ## Smoke training runs
 Run short 2-epoch trainings for Faster R-CNN and RetinaNet:
@@ -42,7 +56,13 @@ python src\smoke_train.py --epochs 2
 ```
 
 ## Optuna hyperparameter search
-Kick off an Optuna study for Faster R-CNN:
+Kick off Optuna studies for all models:
 ```bash
-python src\optuna_search.py --trials 100
+python src\optuna_search.py --model all --trials 100 --study-dir optuna_studies
+```
+Print the best parameter combination found by Optuna for each model type:
+```bash
+python src\optuna_search.py --model fasterrcnn --print-best --study-dir optuna_studies
+python src\optuna_search.py --model retinanet --print-best --study-dir optuna_studies
+python src\optuna_search.py --model yolo11 --print-best --study-dir optuna_studies
 ```

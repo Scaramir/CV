@@ -16,6 +16,7 @@ dependencies = [
     "torchinfo",
     "torchxrayvision",
     "datasets",
+    "lightning>=2.6.4",
     "scikit-learn",
     "pandas",
     "pytest>=7.3.1",
