@@ -12,16 +12,21 @@ dependencies = [
     "torchvision",
     "torchaudio",
     "torcheval",
+    "torchmetrics",
+    "torchinfo",
     "torchxrayvision",
     "datasets",
     "scikit-learn",
     "pandas",
+    "pytest>=7.3.1",
     "numpy",
     "matplotlib",
     "seaborn",
     "jupyterlab",
     "mlflow>=2.0",
-    "optuna>=3.0"
+    "optuna>=3.0",
+    "pycocotools",
+    "ultralytics>=8.3.0"
 ]
 
 [[tool.uv.index]]

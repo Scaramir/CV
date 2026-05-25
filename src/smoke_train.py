@@ -1,42 +1,30 @@
 import argparse
 
-from amia import (
-    batch_size,
-    build_fasterrcnn_model,
-    build_retinanet_model,
-    class_names,
-    dict_path,
-    inf_folder_path,
-    load_and_augment_images,
-    pic_folder_path,
-    train_and_evaluate,
-)
+from amia import TrainingConfig, run_training
 
 
 def run_smoke_training(num_epochs=2):
-    dataloaders, _, num_classes = load_and_augment_images(
-        pic_folder_path, inf_folder_path, dict_path, batch_size, class_names
-    )
-
-    faster_model = build_fasterrcnn_model(num_classes=num_classes)
-    train_and_evaluate(
-        faster_model,
-        dataloaders["train"],
-        dataloaders["test"],
-        num_epochs=num_epochs,
+    faster_config = TrainingConfig(
+        model_type="fasterrcnn",
+        epochs=num_epochs,
+        batch_size=1,
         experiment_name="amia-smoke",
         run_name="fasterrcnn-smoke",
+        train_limit=100,
+        val_limit=100,
     )
+    run_training(faster_config)
 
-    retinanet_model = build_retinanet_model(num_classes=num_classes)
-    train_and_evaluate(
-        retinanet_model,
-        dataloaders["train"],
-        dataloaders["test"],
-        num_epochs=num_epochs,
+    retinanet_config = TrainingConfig(
+        model_type="retinanet",
+        epochs=num_epochs,
+        batch_size=1,
         experiment_name="amia-smoke",
         run_name="retinanet-smoke",
+        train_limit=100,
+        val_limit=100,
     )
+    run_training(retinanet_config)
 
 
 if __name__ == "__main__":

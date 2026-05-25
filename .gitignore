@@ -6,5 +6,6 @@ slides/
 src/cVlpYpp2byuSkcYHgUeF68Hm7t10n6QM,Pleural.csv
 amia/
 mlruns/
-openvino/
+mlflow.db
 *.pt
+openvino/
