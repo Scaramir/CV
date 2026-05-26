@@ -1,12 +1,13 @@
 import argparse
 import contextlib
 import copy
+import hashlib
 import math
 import os
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
-from typing import Callable
+from typing import Callable, Iterable
 from pathlib import Path
 from tqdm.autonotebook import tqdm as tqdm
 import torch
@@ -68,6 +69,11 @@ DEFAULT_IMG_SIZE_CSV = DEFAULT_DATA_ROOT / "img_size.csv"
 DEFAULT_IMAGE_DICT_PATH = DEFAULT_DATA_ROOT / "image_dict.json"
 DEFAULT_MLFLOW_DB = REPO_ROOT / "mlflow.db"
 DEFAULT_ARTIFACT_ROOT = REPO_ROOT / "mlruns"
+DEFAULT_SCRATCH_ROOT = Path("/tmp")
+SCRATCH_DATASET_SUBDIR = "datasets"
+SCRATCH_YOLO_SUBDIR = "yolo11"
+DATASET_STAGE_MARKER = ".amia_dataset_stage.json"
+YOLO_STAGE_MARKER = ".amia_yolo_stage.json"
 
 batch_size = 24
 
@@ -218,6 +224,219 @@ class TrainingConfig:
     yolo_conf_thresh: float = 0.01
     yolo_iou_thresh: float = 0.7
     yolo_warmup_epochs: float = 1.0
+
+
+@dataclass(frozen=True)
+class ScratchStageResult:
+    source_dir: Path
+    staged_dir: Path
+    staged: bool
+    message: str
+
+
+@dataclass(frozen=True)
+class YoloScratchPlan:
+    yolo_root: Path
+    persist_root: Path | None
+    staged: bool
+    message: str
+
+
+def is_slurm_run() -> bool:
+    return any(
+        os.getenv(var)
+        for var in (
+            "SLURM_JOB_ID",
+            "SLURM_JOBID",
+            "SLURM_CLUSTER_NAME",
+            "SLURM_STEP_ID",
+            "SLURM_TASK_PID",
+        )
+    )
+
+
+def resolve_scratch_root() -> Path:
+    for var in ("SLURM_TMPDIR", "TMPDIR", "TMP"):
+        value = os.getenv(var)
+        if value:
+            return Path(value).expanduser().resolve()
+    return DEFAULT_SCRATCH_ROOT.resolve()
+
+
+def _safe_resolve(path: Path | str) -> Path:
+    return Path(path).expanduser().resolve()
+
+
+def _is_within(path: Path, root: Path) -> bool:
+    path = _safe_resolve(path)
+    root = _safe_resolve(root)
+    return path == root or root in path.parents
+
+
+def _fingerprint_files(source: Path, relative_paths: Iterable[str]) -> dict[str, dict[str, int]]:
+    payload: dict[str, dict[str, int]] = {}
+    for rel in relative_paths:
+        path = source / rel
+        if not path.exists():
+            continue
+        stat = path.stat()
+        payload[rel] = {"size": int(stat.st_size), "mtime_ns": int(stat.st_mtime_ns)}
+    return payload
+
+
+def _dataset_fingerprint(source: Path) -> dict[str, object]:
+    key_files = ["train.csv", "img_size.csv", "image_dict.json"]
+    return {"source": str(source), "files": _fingerprint_files(source, key_files)}
+
+
+def _yolo_fingerprint(source: Path) -> dict[str, object]:
+    key_files = [
+        "dataset.yaml",
+        "images/train",
+        "images/val",
+        "labels/train",
+        "labels/val",
+    ]
+    return {"source": str(source), "files": _fingerprint_files(source, key_files)}
+
+
+def _target_for_source(source: Path, scratch_root: Path, subdir: str) -> Path:
+    digest = hashlib.sha1(str(source).encode("utf-8")).hexdigest()[:12]
+    return scratch_root / "amia" / subdir / f"{source.name}-{digest}"
+
+
+def _marker_matches(target: Path, marker_name: str, fingerprint: dict[str, object]) -> bool:
+    marker = target / marker_name
+    if not marker.exists():
+        return False
+    try:
+        existing = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return existing == fingerprint
+
+
+def _copy_tree(source: Path, target: Path) -> None:
+    def copy_or_link(src: str, dst: str) -> None:
+        try:
+            os.link(src, dst)
+        except OSError:
+            shutil.copy2(src, dst)
+
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(source, target, dirs_exist_ok=True, copy_function=copy_or_link)
+
+
+def stage_dataset_to_scratch(
+    dataset_root: Path, scratch_root: Path, force: bool = False
+) -> ScratchStageResult:
+    source = _safe_resolve(dataset_root)
+    target = _target_for_source(source, scratch_root, SCRATCH_DATASET_SUBDIR)
+    fingerprint = _dataset_fingerprint(source)
+    if not force and target.exists() and _marker_matches(target, DATASET_STAGE_MARKER, fingerprint):
+        return ScratchStageResult(
+            source, target, True, f"Using existing staged dataset at {target}."
+        )
+    if target.exists():
+        shutil.rmtree(target)
+    _copy_tree(source, target)
+    (target / DATASET_STAGE_MARKER).write_text(
+        json.dumps(fingerprint, indent=2), encoding="utf-8"
+    )
+    return ScratchStageResult(source, target, True, f"Staged dataset at {target}.")
+
+
+def _remap_to_scratch(path: Path, source_root: Path, scratch_root: Path, label: str) -> Path:
+    try:
+        rel = _safe_resolve(path).relative_to(source_root)
+    except ValueError:
+        warnings.warn(
+            f"{label}={path} is outside dataset_root {source_root}; using original path."
+        )
+        return path
+    return scratch_root / rel
+
+
+def maybe_stage_training_dataset(config: TrainingConfig) -> ScratchStageResult | None:
+    if not is_slurm_run():
+        return None
+    if getattr(config, "_scratch_staged", False):
+        return None
+    scratch_root = resolve_scratch_root()
+    source_root = _safe_resolve(config.dataset_root)
+    if _is_within(source_root, scratch_root):
+        return None
+    result = stage_dataset_to_scratch(source_root, scratch_root)
+    config.train_dir = _remap_to_scratch(
+        config.train_dir, source_root, result.staged_dir, "train_dir"
+    )
+    config.test_dir = _remap_to_scratch(
+        config.test_dir, source_root, result.staged_dir, "test_dir"
+    )
+    config.train_csv_path = _remap_to_scratch(
+        config.train_csv_path, source_root, result.staged_dir, "train_csv_path"
+    )
+    config.img_size_csv_path = _remap_to_scratch(
+        config.img_size_csv_path, source_root, result.staged_dir, "img_size_csv_path"
+    )
+    config.image_dict_path = _remap_to_scratch(
+        config.image_dict_path, source_root, result.staged_dir, "image_dict_path"
+    )
+    print(result.message)
+    setattr(config, "_scratch_staged", True)
+    return result
+
+
+def stage_yolo_dataset_to_scratch(
+    yolo_root: Path, scratch_root: Path, force: bool = False
+) -> ScratchStageResult:
+    source = _safe_resolve(yolo_root)
+    target = _target_for_source(source, scratch_root, SCRATCH_YOLO_SUBDIR)
+    fingerprint = _yolo_fingerprint(source)
+    if not force and target.exists() and _marker_matches(target, YOLO_STAGE_MARKER, fingerprint):
+        return ScratchStageResult(
+            source, target, True, f"Using existing staged YOLO dataset at {target}."
+        )
+    if target.exists():
+        shutil.rmtree(target)
+    _copy_tree(source, target)
+    (target / YOLO_STAGE_MARKER).write_text(
+        json.dumps(fingerprint, indent=2), encoding="utf-8"
+    )
+    return ScratchStageResult(source, target, True, f"Staged YOLO dataset at {target}.")
+
+
+def resolve_yolo_scratch_plan(config: TrainingConfig) -> YoloScratchPlan:
+    if not is_slurm_run():
+        return YoloScratchPlan(
+            config.yolo_dataset_root,
+            None,
+            False,
+            "YOLO dataset staging skipped (SLURM not detected).",
+        )
+    scratch_root = resolve_scratch_root()
+    source_root = _safe_resolve(config.yolo_dataset_root)
+    if _is_within(source_root, scratch_root):
+        return YoloScratchPlan(
+            source_root, None, False, "YOLO dataset already on scratch."
+        )
+    dataset_yaml = source_root / "dataset.yaml"
+    if dataset_yaml.exists() and not config.yolo_rebuild_dataset:
+        staged = stage_yolo_dataset_to_scratch(source_root, scratch_root)
+        return YoloScratchPlan(staged.staged_dir, None, True, staged.message)
+    scratch_yolo_root = _target_for_source(source_root, scratch_root, SCRATCH_YOLO_SUBDIR)
+    return YoloScratchPlan(
+        scratch_yolo_root,
+        source_root,
+        False,
+        f"Preparing YOLO dataset on scratch at {scratch_yolo_root}.",
+    )
+
+
+def persist_yolo_dataset(scratch_root: Path, persist_root: Path) -> None:
+    if persist_root.exists():
+        shutil.rmtree(persist_root)
+    _copy_tree(scratch_root, persist_root)
 
 
 # --------------- Helper functions ------------------
@@ -1140,7 +1359,15 @@ def train_yolo11(config: TrainingConfig, train_ids, val_ids, nested_run: bool = 
             "YOLO11 training requires ultralytics. Install it with `uv pip install ultralytics`."
         ) from exc
 
+    yolo_plan = resolve_yolo_scratch_plan(config)
+    if yolo_plan.yolo_root != config.yolo_dataset_root:
+        config.yolo_dataset_root = yolo_plan.yolo_root
+    if is_slurm_run():
+        print(yolo_plan.message)
     dataset_yaml = prepare_yolo_dataset(config, train_ids, val_ids)
+    if yolo_plan.persist_root is not None:
+        persist_yolo_dataset(config.yolo_dataset_root, yolo_plan.persist_root)
+        print(f"Copied YOLO dataset back to {yolo_plan.persist_root}.")
     model = YOLO(config.yolo_model)
 
     if config.log_with_mlflow:
@@ -1837,6 +2064,8 @@ def evaluate_and_create_csv(model, test_dataloader, device):
             f.write(f"{result}\n")
 
 def build_dataloaders_from_config(config: TrainingConfig):
+    config = normalize_config(config)
+    maybe_stage_training_dataset(config)
     image_dict_path = ensure_image_dict(config)
     dataloaders, _, num_classes, train_ids, test_ids = load_and_augment_images(
         str(config.train_dir),

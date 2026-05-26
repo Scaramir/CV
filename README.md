@@ -49,6 +49,9 @@ To regenerate the image dictionary JSON from `train.csv` and `img_size.csv`:
 python src\amia.py --rebuild-image-dict
 ```
 
+## SLURM scratch staging
+On SLURM nodes, the dataset is automatically copied from the configured data root to node-local scratch (`$SLURM_TMPDIR` or `/tmp`) for faster I/O, while MLflow artifacts and model outputs still write to the repo directory for live monitoring. For YOLO11, an existing dataset under `data/yolo11` is staged to scratch; if it does not exist, it is built on the compute node and synced back to the original location before training starts.
+
 ## Smoke training runs
 Run short 2-epoch trainings for Faster R-CNN and RetinaNet:
 ```bash
