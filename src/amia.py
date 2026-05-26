@@ -501,8 +501,6 @@ class XRayImageDataset(Dataset):
 
         box_list = []
         label_list = []
-        area_list = []
-        iscrowd_list = []
         for class_id in self.dict[img_id]["classes"]:
             if class_id == "14":
                 continue
@@ -514,8 +512,6 @@ class XRayImageDataset(Dataset):
                     if len(box) == 4 and box[2] > box[0] and box[3] > box[1]:
                         box_list.append([coord * image.shape[-1] for coord in box])
                         label_list.append(label_mapping[class_id])
-                        area_list.append((box[2] - box[0]) * (box[3] - box[1]))
-                        iscrowd_list.append(0)
                     else:
                         print(f"Invalid Box found at {img_id} with {box}")
             if self.nms:
@@ -528,22 +524,30 @@ class XRayImageDataset(Dataset):
                 # now keep only the values of the indices that are in boxes_to_keep
                 box_list = [box_list[i] for i in boxes_to_keep]
                 label_list = [label_list[i] for i in boxes_to_keep]
-                area_list = [area_list[i] for i in boxes_to_keep]
-                iscrowd_list = [iscrowd_list[i] for i in boxes_to_keep]
 
+        canvas_size = (image.shape[-2], image.shape[-1])
         if len(box_list) > 0:
             boxes_tensor = tv_tensors.BoundingBoxes(
-                box_list, format="XYXY", canvas_size=(image.shape[-1], image.shape[-1])
+                torch.as_tensor(box_list, dtype=torch.float32),
+                format="XYXY",
+                canvas_size=canvas_size,
             )
         else:
-            empty_boxes = np.array([]).reshape(-1, 4)
-            boxes_tensor = torch.as_tensor(empty_boxes, dtype=torch.int16)
+            boxes_tensor = tv_tensors.BoundingBoxes(
+                torch.zeros((0, 4), dtype=torch.float32),
+                format="XYXY",
+                canvas_size=canvas_size,
+            )
         labels_tensor = torch.tensor(label_list, dtype=torch.int64)
-        areas_tensor = torch.tensor(area_list, dtype=torch.int32)
-        iscrowd_tensor = torch.tensor(iscrowd_list, dtype=torch.uint8)
 
         if self.transform_norm:
             image, boxes_tensor = self.transform_norm(image, boxes_tensor)
+
+        boxes_tensor, labels_tensor, keep = sanitize_boxes_and_targets(
+            boxes_tensor, labels_tensor, image
+        )
+        areas_tensor = compute_box_areas(boxes_tensor)
+        iscrowd_tensor = torch.zeros_like(labels_tensor, dtype=torch.uint8)
 
         target = {
             "boxes": boxes_tensor,
@@ -555,6 +559,49 @@ class XRayImageDataset(Dataset):
         }
 
         return image, target
+
+
+def sanitize_boxes_and_targets(
+    boxes_tensor: torch.Tensor,
+    labels_tensor: torch.Tensor,
+    image: torch.Tensor,
+):
+    if isinstance(boxes_tensor, tv_tensors.BoundingBoxes):
+        canvas_size = boxes_tensor.canvas_size
+    else:
+        canvas_size = (image.shape[-2], image.shape[-1])
+
+    height, width = image.shape[-2], image.shape[-1]
+    if boxes_tensor.numel() == 0:
+        empty_boxes = tv_tensors.BoundingBoxes(
+            torch.zeros((0, 4), dtype=torch.float32),
+            format="XYXY",
+            canvas_size=canvas_size,
+        )
+        empty_labels = labels_tensor[:0]
+        return empty_boxes, empty_labels, torch.zeros((0,), dtype=torch.bool)
+
+    boxes = boxes_tensor.to(torch.float32).clone()
+    boxes[:, 0].clamp_(0, width - 1)
+    boxes[:, 2].clamp_(0, width - 1)
+    boxes[:, 1].clamp_(0, height - 1)
+    boxes[:, 3].clamp_(0, height - 1)
+
+    keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
+    boxes = boxes[keep]
+    labels_tensor = labels_tensor[keep]
+
+    cleaned_boxes = tv_tensors.BoundingBoxes(
+        boxes, format="XYXY", canvas_size=canvas_size
+    )
+    return cleaned_boxes, labels_tensor, keep
+
+
+def compute_box_areas(boxes_tensor: torch.Tensor) -> torch.Tensor:
+    if boxes_tensor.numel() == 0:
+        return torch.zeros((0,), dtype=torch.float32)
+    boxes = boxes_tensor.to(torch.float32)
+    return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
 
 class RandomGamma(v2.Transform):
@@ -1085,7 +1132,7 @@ def extract_yolo_map(model) -> float | None:
     return None
 
 
-def train_yolo11(config: TrainingConfig, train_ids, val_ids):
+def train_yolo11(config: TrainingConfig, train_ids, val_ids, nested_run: bool = False):
     try:
         from ultralytics import YOLO
     except ImportError as exc:
@@ -1098,7 +1145,7 @@ def train_yolo11(config: TrainingConfig, train_ids, val_ids):
 
     if config.log_with_mlflow:
         setup_mlflow(config)
-        run_context = mlflow.start_run(run_name=config.run_name)
+        run_context = mlflow.start_run(run_name=config.run_name, nested=nested_run)
     else:
         run_context = contextlib.nullcontext()
 
@@ -1317,6 +1364,9 @@ def setup_mlflow(config: TrainingConfig):
         mlflow.set_tracking_uri(f"sqlite:///{DEFAULT_MLFLOW_DB}")
 
     experiment = mlflow.get_experiment_by_name(config.experiment_name)
+    if experiment is not None and experiment.lifecycle_stage != "active":
+        config.experiment_name = f"{config.experiment_name}-revived"
+        experiment = None
     if experiment is not None and "://" not in experiment.artifact_location:
         fallback_name = f"{config.experiment_name}-local"
         fallback = mlflow.get_experiment_by_name(fallback_name)
@@ -1348,6 +1398,7 @@ def train_and_evaluate(
     train_ids=None,
     test_ids=None,
     reporter: Callable[[int, float, float], None] | None = None,
+    nested_run: bool = False,
 ):
     set_seeds(
         config.seed,
@@ -1438,7 +1489,7 @@ def train_and_evaluate(
 
     if config.log_with_mlflow:
         setup_mlflow(config)
-        run_context = mlflow.start_run(run_name=config.run_name)
+        run_context = mlflow.start_run(run_name=config.run_name, nested=nested_run)
     else:
         run_context = contextlib.nullcontext()
 
@@ -1529,24 +1580,27 @@ def train_and_evaluate(
                 else:
                     images = [image.to(device) for image in images]
                 targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
-                found_invalid_box = False
-                # check if the targets(bounding boxes) are smaller than the image size and have the correct format (positive width and height)
-                for target in targets:
-                    for box in target["boxes"]:
-                        if box[2] <= box[0] or box[3] <= box[1]:
-                            found_invalid_box = True
-                            print(f"Invalid Box found in training with {box}")
-                        if (
-                            box[2] > images[0].shape[-1]
-                            or box[3] > images[0].shape[-2]
-                        ):
-                            found_invalid_box = True
-                            print(f"Box outside of image found in training with {box}")
-                    if found_invalid_box:
-                        print(f"Image: {tensor_to_string(target['filename'])}")
-                        warnings.warn("Invalid box found in training data")
-                if found_invalid_box:
-                    continue
+                sanitized_images = []
+                sanitized_targets = []
+                for image, target in zip(images, targets):
+                    boxes, labels, keep = sanitize_boxes_and_targets(
+                        target["boxes"], target["labels"], image
+                    )
+                    if keep.numel() > 0 and not torch.all(keep):
+                        warnings.warn(
+                            f"Dropped {int((~keep).sum().item())} invalid boxes in training batch.",
+                            UserWarning,
+                        )
+                    target["boxes"] = boxes
+                    target["labels"] = labels
+                    target["area"] = compute_box_areas(boxes).to(target["area"].device)
+                    target["iscrowd"] = torch.zeros_like(
+                        target["labels"], dtype=target["iscrowd"].dtype
+                    )
+                    sanitized_images.append(image)
+                    sanitized_targets.append(target)
+                images = sanitized_images
+                targets = sanitized_targets
 
                 # Apply mixed precision training
                 with torch.amp.autocast(
@@ -1628,6 +1682,21 @@ def train_and_evaluate(
                     else:
                         images = [image.to(device) for image in images]
                     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    sanitized_targets = []
+                    for image, target in zip(images, targets):
+                        boxes, labels, _ = sanitize_boxes_and_targets(
+                            target["boxes"], target["labels"], image
+                        )
+                        target["boxes"] = boxes
+                        target["labels"] = labels
+                        target["area"] = compute_box_areas(boxes).to(
+                            target["area"].device
+                        )
+                        target["iscrowd"] = torch.zeros_like(
+                            target["labels"], dtype=target["iscrowd"].dtype
+                        )
+                        sanitized_targets.append(target)
+                    targets = sanitized_targets
                     predictions = eval_model(images)
 
                     filtered_predictions = []
