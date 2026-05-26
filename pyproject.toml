@@ -8,11 +8,11 @@ authors = [
     ]
 dependencies = [
     "black>=26.5.1",
-    "torch",
-    "torchvision",
-    "torchaudio",
-    "torcheval",
-    "torchmetrics",
+    "torch==2.12.0",
+    "torchvision==0.27.0",
+    "torchaudio==2.11.0",
+    "torcheval==0.0.7",
+    "torchmetrics==1.9.0",
     "torchinfo",
     "torchxrayvision",
     "datasets",
@@ -42,6 +42,8 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cu126" }
 torchvision = { index = "pytorch-cu126" }
+torchaudio = { index = "pytorch-cu126" }
+
 
 [tool.pytest.ini_options]
 # restrict pytest to our python source tree; ignores data folders
