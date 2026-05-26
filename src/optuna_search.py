@@ -102,7 +102,7 @@ def build_trial_config(
         box_score_thresh=box_score_thresh,
         experiment_name=f"amia-optuna-{model_type}",
         run_name=f"trial-{trial.number}",
-        log_with_mlflow=False,
+        log_with_mlflow=True,
         seed=seed,
         train_limit=train_limit,
         val_limit=val_limit,
@@ -183,7 +183,8 @@ def log_best_to_mlflow(
     mlflow_config.run_name = f"best-{model_type}"
     mlflow_config.log_with_mlflow = True
     setup_mlflow(mlflow_config)
-    with mlflow.start_run(run_name=mlflow_config.run_name):
+    nested_run = mlflow.active_run() is not None
+    with mlflow.start_run(run_name=mlflow_config.run_name, nested=nested_run):
         mlflow.log_metric("best_value", meta["best_value"])
         mlflow.log_params(meta["params"])
         mlflow.log_artifact(str(json_path), artifact_path="best_config")
@@ -250,6 +251,7 @@ def objective(
             train_ids=train_ids,
             test_ids=test_ids,
             reporter=reporter,
+            nested_run=True,
         )
         map_value = map_history[-1] if map_history else 0.0
         save_best_trial(
@@ -271,6 +273,7 @@ def objective(
             train_ids=train_ids,
             test_ids=test_ids,
             reporter=reporter,
+            nested_run=True,
         )
         map_value = map_history[-1] if map_history else 0.0
         save_best_trial(
@@ -278,7 +281,9 @@ def objective(
         )
         return map_value
 
-    model, _, map_history, _ = train_yolo11(config, train_ids=train_ids, val_ids=test_ids)
+    model, _, map_history, _ = train_yolo11(
+        config, train_ids=train_ids, val_ids=test_ids, nested_run=True
+    )
     map_value = map_history[-1] if map_history else 0.0
     save_best_trial(
         model_type, map_value, config, trial.params, model, best_state, checkpoint_dir
@@ -317,19 +322,28 @@ def run_study(
         load_if_exists=True,
         pruner=pruner,
     )
-    study.optimize(
-        lambda trial: objective(
-            trial,
-            model_type,
-            seed,
-            train_limit,
-            val_limit,
-            best_state,
-            checkpoint_dir,
-            prune_metric,
-        ),
-        n_trials=trials,
+    base_config = TrainingConfig(
+        model_type=model_type,
+        experiment_name=study_name,
+        run_name=f"optuna-study-{model_type}",
+        log_with_mlflow=True,
     )
+    setup_mlflow(base_config)
+    nested_parent = mlflow.active_run() is not None
+    with mlflow.start_run(run_name=base_config.run_name, nested=nested_parent):
+        study.optimize(
+            lambda trial: objective(
+                trial,
+                model_type,
+                seed,
+                train_limit,
+                val_limit,
+                best_state,
+                checkpoint_dir,
+                prune_metric,
+            ),
+            n_trials=trials,
+        )
     return study
 
 
