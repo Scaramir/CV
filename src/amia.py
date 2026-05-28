@@ -161,7 +161,7 @@ class TrainingConfig:
     weight_decay: float = 0.0005
     scheduler_gamma: float = 0.95
     optimizer_name: str = "adamw"
-    scheduler_name: str = "cosine"
+    scheduler_name: str = "exponential"
     warmup_epochs: int = 1
     warmup_start_factor: float = 0.1
     onecycle_pct_start: float = 0.3
@@ -203,6 +203,9 @@ class TrainingConfig:
     auto_scale_mode: str = "binsearch"
     auto_scale_steps_per_trial: int = 3
     auto_scale_max_trials: int = 10
+    cyclic_max_lr: float | None = None
+    cyclic_epochs_per_cycle: int = 10
+    cyclic_mode: str = "exp_range"
     yolo_model: str = "yolo11s.pt"
     yolo_imgsz: int = 640
     yolo_dataset_root: Path = REPO_ROOT / "data" / "yolo11"
@@ -762,7 +765,7 @@ class XRayImageDataset(Dataset):
         if self.transform_norm:
             image, boxes_tensor = self.transform_norm(image, boxes_tensor)
 
-        boxes_tensor, labels_tensor, keep = sanitize_boxes_and_targets(
+        boxes_tensor, labels_tensor, keep, _ = sanitize_boxes_and_targets(
             boxes_tensor, labels_tensor, image
         )
         areas_tensor = compute_box_areas(boxes_tensor)
@@ -785,6 +788,20 @@ def sanitize_boxes_and_targets(
     labels_tensor: torch.Tensor,
     image: torch.Tensor,
 ):
+    """Sanitize bounding boxes for an image.
+
+    Returns:
+        cleaned_boxes: BoundingBoxes with valid (clamped) boxes
+        labels_tensor: tensor of labels corresponding to cleaned_boxes
+        keep: boolean mask of which original boxes were kept
+        unrecoverable: bool, True if image has invalid boxes that are not just flipped
+    Behavior:
+    - If boxes are empty, returns empty structures and unrecoverable=False
+    - If boxes have swapped coordinates (x2<=x1 or y2<=y1), attempts to swap them.
+    - If any box has coords outside image bounds (before swapping) or cannot be
+      fixed by swapping, the image is marked unrecoverable (should be dropped from batch).
+    """
+    device = boxes_tensor.device if torch.is_tensor(boxes_tensor) else image.device
     if isinstance(boxes_tensor, tv_tensors.BoundingBoxes):
         canvas_size = boxes_tensor.canvas_size
     else:
@@ -793,32 +810,83 @@ def sanitize_boxes_and_targets(
     height, width = image.shape[-2], image.shape[-1]
     if boxes_tensor.numel() == 0:
         empty_boxes = tv_tensors.BoundingBoxes(
-            torch.zeros((0, 4), dtype=torch.float32),
+            torch.zeros((0, 4), dtype=torch.float32, device=device),
             format="XYXY",
             canvas_size=canvas_size,
         )
-        empty_labels = labels_tensor[:0]
-        return empty_boxes, empty_labels, torch.zeros((0,), dtype=torch.bool)
+        empty_labels = labels_tensor[:0].to(device)
+        return empty_boxes, empty_labels, torch.zeros((0,), dtype=torch.bool, device=device), False
 
-    boxes = boxes_tensor.to(torch.float32).clone()
-    boxes[:, 0].clamp_(0, width - 1)
-    boxes[:, 2].clamp_(0, width - 1)
-    boxes[:, 1].clamp_(0, height - 1)
-    boxes[:, 3].clamp_(0, height - 1)
+    # Work on a float clone of the original boxes so we can inspect pre-clamp values
+    orig = boxes_tensor.to(torch.float32).clone()
 
-    keep = (boxes[:, 2] > boxes[:, 0]) & (boxes[:, 3] > boxes[:, 1])
-    boxes = boxes[keep]
+    # Detect boxes that are out-of-bounds before any clamping or swapping
+    out_of_bounds = (
+        (orig[:, 0] < 0)
+        | (orig[:, 1] < 0)
+        | (orig[:, 2] > (width - 1))
+        | (orig[:, 3] > (height - 1))
+    )
+
+    # Detect swapped coordinates (possible simple flip)
+    swapped = (orig[:, 2] <= orig[:, 0]) | (orig[:, 3] <= orig[:, 1])
+
+    # If any box is out of bounds, treat as unrecoverable (not just flipped)
+    if out_of_bounds.any():
+        return (
+            tv_tensors.BoundingBoxes(torch.zeros((0, 4), dtype=torch.float32, device=device), format="XYXY", canvas_size=canvas_size),
+            labels_tensor[:0].to(device),
+            torch.zeros((0,), dtype=torch.bool, device=device),
+            True,
+        )
+
+    # For swapped boxes, attempt to correct by swapping coordinates per-axis
+    fixed = orig.clone()
+    for i in range(fixed.shape[0]):
+        x1, y1, x2, y2 = fixed[i].tolist()
+        changed = False
+        if x2 <= x1:
+            x1, x2 = x2, x1
+            changed = True
+        if y2 <= y1:
+            y1, y2 = y2, y1
+            changed = True
+        fixed[i, 0] = x1
+        fixed[i, 1] = y1
+        fixed[i, 2] = x2
+        fixed[i, 3] = y2
+
+    # Now clamp corrected boxes to image bounds
+    fixed[:, 0].clamp_(0, width - 1)
+    fixed[:, 2].clamp_(0, width - 1)
+    fixed[:, 1].clamp_(0, height - 1)
+    fixed[:, 3].clamp_(0, height - 1)
+
+    # Keep only boxes with positive area after correction
+    keep = (fixed[:, 2] > fixed[:, 0]) & (fixed[:, 3] > fixed[:, 1])
+
+    # If any boxes were dropped after attempting fixes, treat image as unrecoverable
+    if not torch.all(keep):
+        return (
+            tv_tensors.BoundingBoxes(torch.zeros((0, 4), dtype=torch.float32, device=device), format="XYXY", canvas_size=canvas_size),
+            labels_tensor[:0].to(device),
+            torch.zeros((0,), dtype=torch.bool, device=device),
+            True,
+        )
+
+    boxes = fixed[keep]
     labels_tensor = labels_tensor[keep]
 
     cleaned_boxes = tv_tensors.BoundingBoxes(
         boxes, format="XYXY", canvas_size=canvas_size
     )
-    return cleaned_boxes, labels_tensor, keep
+    return cleaned_boxes, labels_tensor, keep, False
 
 
 def compute_box_areas(boxes_tensor: torch.Tensor) -> torch.Tensor:
     if boxes_tensor.numel() == 0:
-        return torch.zeros((0,), dtype=torch.float32)
+        device = boxes_tensor.device if torch.is_tensor(boxes_tensor) else None
+        return torch.zeros((0,), dtype=torch.float32, device=device)
     boxes = boxes_tensor.to(torch.float32)
     return (boxes[:, 2] - boxes[:, 0]) * (boxes[:, 3] - boxes[:, 1])
 
@@ -981,14 +1049,17 @@ def build_xray_transforms(
 
     train_transforms.append(v2.Normalize(mean=[mean], std=[std]))
 
-    test_transforms = v2.Compose(
-        [
-            v2.Resize(img_size, antialias=True),
-            v2.Grayscale(num_output_channels=1),
-            v2.ToDtype(torch.float32, scale=True),
-            v2.Normalize(mean=[mean], std=[std]),
-        ]
-    )
+    test_transforms_list = [
+        v2.Resize(img_size, antialias=True),
+        v2.Grayscale(num_output_channels=1),
+        v2.ToDtype(torch.float32, scale=True),
+    ]
+    # If training uses full histogram equalization (p==1.0), apply it deterministically at test time as well
+    if aug.equalize_p >= 1.0:
+        test_transforms_list.append(v2.RandomEqualize(p=1.0))
+    test_transforms_list.append(v2.Normalize(mean=[mean], std=[std]))
+    test_transforms = v2.Compose(test_transforms_list)
+
 
     return {
         "train": v2.Compose(train_transforms),
@@ -1002,10 +1073,10 @@ def load_and_augment_images(
     dict_path,
     batch_size,
     class_names,
-    img_size=448,
+    img_size=1024, # 448 was used
     use_normalize=False,
     train_split=0.8,
-    nms_iou_thresh=0.5,
+    nms_iou_thresh=0.4,
     seed=123420,
     train_limit=None,
     val_limit=None,
@@ -1065,8 +1136,6 @@ def load_and_augment_images(
     }  # if "14" not in og_dict[k]["classes"]}
     # print("Remaining test dict length: ", len(test_dict))
 
-    # size for images
-    img_size = img_size
     train_dataset = XRayImageDataset(
         train_dict,
         img_size,
@@ -1351,7 +1420,13 @@ def extract_yolo_map(model) -> float | None:
     return None
 
 
-def train_yolo11(config: TrainingConfig, train_ids, val_ids, nested_run: bool = False):
+def train_yolo11(
+    config: TrainingConfig,
+    train_ids,
+    val_ids,
+    nested_run: bool = False,
+    start_mlflow_run: bool = True,
+):
     try:
         from ultralytics import YOLO
     except ImportError as exc:
@@ -1372,7 +1447,18 @@ def train_yolo11(config: TrainingConfig, train_ids, val_ids, nested_run: bool = 
 
     if config.log_with_mlflow:
         setup_mlflow(config)
-        run_context = mlflow.start_run(run_name=config.run_name, nested=nested_run)
+        parent_active = mlflow.active_run() is not None
+        if start_mlflow_run:
+            if parent_active and not nested_run:
+                run_context = contextlib.nullcontext()
+            else:
+                run_context = mlflow.start_run(
+                    run_name=config.run_name, nested=parent_active
+                )
+        elif not parent_active:
+            run_context = mlflow.start_run(run_name=config.run_name)
+        else:
+            run_context = contextlib.nullcontext()
     else:
         run_context = contextlib.nullcontext()
 
@@ -1509,16 +1595,39 @@ def find_optimal_batch_size(
             )
 
     class BatchSizeFinderModule(pl.LightningModule):
-        def __init__(self, model: nn.Module, optimizer_name: str, lr: float, weight_decay: float):
+        def __init__(
+            self,
+            model: nn.Module,
+            optimizer_name: str,
+            lr: float,
+            weight_decay: float,
+            use_amp: bool,
+            amp_dtype: str,
+        ):
             super().__init__()
             self.model = model
             self.optimizer_name = optimizer_name
             self.lr = lr
             self.weight_decay = weight_decay
+            self.use_amp = use_amp
+            self.amp_dtype = amp_dtype
+
+        def _resolve_amp_dtype(self) -> torch.dtype:
+            return torch.bfloat16 if self.amp_dtype == "bf16" else torch.float16
 
         def training_step(self, batch, batch_idx):
             images, targets = batch
-            loss_dict = self.model(images, targets)
+            device = self.device
+            if device.type == "cuda":
+                images = [image.to(device) for image in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            use_amp = self.use_amp and device.type == "cuda"
+            with torch.amp.autocast(
+                device_type=device.type,
+                dtype=self._resolve_amp_dtype(),
+                enabled=use_amp,
+            ):
+                loss_dict = self.model(images, targets)
             return sum(loss for loss in loss_dict.values())
 
         def configure_optimizers(self):
@@ -1554,14 +1663,23 @@ def find_optimal_batch_size(
         )
 
     lightning_model = BatchSizeFinderModule(
-        base_model, config.optimizer_name.lower(), config.lr, config.weight_decay
+        base_model,
+        config.optimizer_name.lower(),
+        config.lr,
+        config.weight_decay,
+        config.use_amp,
+        config.amp_dtype,
     )
     data_module = BatchSizeDataModule(train_dataset, config.batch_size)
 
+    precision = "32"
+    if config.use_amp:
+        precision = "bf16-mixed" if config.amp_dtype == "bf16" else "16-mixed"
     trainer = pl.Trainer(
         accelerator="gpu" if torch.cuda.is_available() else "cpu",
         devices=1,
         max_epochs=1,
+        precision=precision,
         logger=False,
         enable_checkpointing=False,
         enable_model_summary=False,
@@ -1577,6 +1695,137 @@ def find_optimal_batch_size(
         max_trials=config.auto_scale_max_trials,
     )
     return int(data_module.batch_size)
+
+
+def configure_cyclic_decay_lr(
+    optimizer: torch.optim.Optimizer,
+    base_lr: float,
+    max_lr: float,
+    steps_per_epoch: int,
+    epochs_per_cycle: int = 10,
+    mode: str = "exp_range",
+) -> dict[str, object]:
+    """Configures a native PyTorch CyclicLR scheduler with amplitude decay.
+
+    Handles continuous scaling across an infinite training horizon, smoothly
+    stepping every batch to eliminate gradient shock.
+    """
+    if max_lr <= 0 or base_lr <= 0:
+        raise ValueError("base_lr and max_lr must be positive values.")
+
+    half_cycle_epochs = epochs_per_cycle / 2
+    step_size_up = max(1, int(steps_per_epoch * half_cycle_epochs))
+
+    gamma = 0.9994
+
+    is_adam = any(
+        opt_name in type(optimizer).__name__.lower()
+        for opt_name in ["adam", "adamw", "adamax"]
+    )
+    cycle_momentum = False if is_adam else True
+
+    scheduler = torch.optim.lr_scheduler.CyclicLR(
+        optimizer,
+        base_lr=base_lr,
+        max_lr=max_lr,
+        step_size_up=step_size_up,
+        step_size_down=None,
+        mode=mode,
+        gamma=gamma,
+        cycle_momentum=cycle_momentum,
+    )
+
+    return {
+        "scheduler": scheduler,
+        "interval": "step",
+        "frequency": 1,
+    }
+
+
+def find_learning_rate(
+    config: TrainingConfig, num_classes: int, train_dataloader: DataLoader
+) -> float:
+    try:
+        import lightning.pytorch as pl
+        from lightning.pytorch.tuner import Tuner
+    except ImportError as exc:
+        raise ImportError(
+            "Learning rate finding requires lightning. Install it with `uv pip install lightning`."
+        ) from exc
+
+    class LearningRateFinderModule(pl.LightningModule):
+        def __init__(self, model: nn.Module, optimizer_name: str, lr: float, weight_decay: float):
+            super().__init__()
+            self.model = model
+            self.optimizer_name = optimizer_name
+            self.lr = lr
+            self.weight_decay = weight_decay
+
+        def training_step(self, batch, batch_idx):
+            images, targets = batch
+            device = self.device
+            if device.type == "cuda":
+                images = [image.to(device) for image in images]
+                targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+            loss_dict = self.model(images, targets)
+            return sum(loss for loss in loss_dict.values())
+
+        def configure_optimizers(self):
+            if self.optimizer_name == "adamw":
+                return torch.optim.AdamW(
+                    self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                )
+            if self.optimizer_name == "adamax":
+                return torch.optim.Adamax(
+                    self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
+                )
+            if self.optimizer_name == "sgd":
+                return torch.optim.SGD(
+                    self.model.parameters(),
+                    lr=self.lr,
+                    momentum=0.9,
+                    weight_decay=self.weight_decay,
+                )
+            raise ValueError(f"Unsupported optimizer: {self.optimizer_name}")
+
+    if config.model_type == "retinanet":
+        base_model = build_retinanet_model(
+            num_classes=num_classes,
+            box_nms_thresh=config.box_nms_thresh,
+            box_score_thresh=config.box_score_thresh,
+        )
+    else:
+        base_model = build_fasterrcnn_model(
+            num_classes=num_classes,
+            rpn_nms_thresh=config.rpn_nms_thresh,
+            box_nms_thresh=config.box_nms_thresh,
+            box_score_thresh=config.box_score_thresh,
+        )
+
+    lightning_model = LearningRateFinderModule(
+        base_model,
+        config.optimizer_name.lower(),
+        config.lr,
+        config.weight_decay,
+    )
+
+    precision = "32"
+    if config.use_amp:
+        precision = "bf16-mixed" if config.amp_dtype == "bf16" else "16-mixed"
+
+    trainer = pl.Trainer(
+        accelerator="gpu" if torch.cuda.is_available() else "cpu",
+        devices=1,
+        max_epochs=1,
+        precision=precision,
+        logger=False,
+        enable_checkpointing=False,
+        enable_model_summary=False,
+        enable_progress_bar=False,
+    )
+    tuner = Tuner(trainer)
+    lr_finder = tuner.lr_find(lightning_model, train_dataloaders=train_dataloader)
+    return float(lr_finder.suggestion())
 
 # since we use fasterrcnn from torchvision, we can use the losses from the model
 # we need to adjust the losses to include class weights
@@ -1626,6 +1875,7 @@ def train_and_evaluate(
     test_ids=None,
     reporter: Callable[[int, float, float], None] | None = None,
     nested_run: bool = False,
+    start_mlflow_run: bool = True,
 ):
     set_seeds(
         config.seed,
@@ -1662,38 +1912,17 @@ def train_and_evaluate(
     scheduler_name = config.scheduler_name.lower()
     lr_scheduler = None
     step_scheduler_per_batch = False
-    if scheduler_name == "cosine":
-        if config.warmup_epochs > 0:
-            warmup = torch.optim.lr_scheduler.LinearLR(
-                optimizer,
-                start_factor=config.warmup_start_factor,
-                total_iters=config.warmup_epochs,
-            )
-            cosine = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer,
-                T_max=max(1, config.epochs - config.warmup_epochs),
-            )
-            lr_scheduler = torch.optim.lr_scheduler.SequentialLR(
-                optimizer, schedulers=[warmup, cosine], milestones=[config.warmup_epochs]
-            )
-        else:
-            lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                optimizer, T_max=max(1, config.epochs)
-            )
-    elif scheduler_name == "onecycle":
-        steps_per_epoch = max(
-            1, math.ceil(len(train_dataloader) / max(1, config.grad_accum_steps))
-        )
-        lr_scheduler = torch.optim.lr_scheduler.OneCycleLR(
+    if scheduler_name == "cyclic":
+        scheduler_config = configure_cyclic_decay_lr(
             optimizer,
-            max_lr=config.lr,
-            epochs=config.epochs,
-            steps_per_epoch=steps_per_epoch,
-            pct_start=config.onecycle_pct_start,
-            div_factor=config.onecycle_div_factor,
-            final_div_factor=config.onecycle_final_div_factor,
+            base_lr=config.lr,
+            max_lr=config.cyclic_max_lr,
+            steps_per_epoch=len(train_dataloader),
+            epochs_per_cycle=config.cyclic_epochs_per_cycle,
+            mode=config.cyclic_mode,
         )
-        step_scheduler_per_batch = True
+        lr_scheduler = scheduler_config["scheduler"]
+        step_scheduler_per_batch = scheduler_config["interval"] == "step"
     elif scheduler_name == "exponential":
         lr_scheduler = torch.optim.lr_scheduler.ExponentialLR(
             optimizer, gamma=config.scheduler_gamma
@@ -1716,7 +1945,18 @@ def train_and_evaluate(
 
     if config.log_with_mlflow:
         setup_mlflow(config)
-        run_context = mlflow.start_run(run_name=config.run_name, nested=nested_run)
+        parent_active = mlflow.active_run() is not None
+        if start_mlflow_run:
+            if parent_active and not nested_run:
+                run_context = contextlib.nullcontext()
+            else:
+                run_context = mlflow.start_run(
+                    run_name=config.run_name, nested=parent_active
+                )
+        elif not parent_active:
+            run_context = mlflow.start_run(run_name=config.run_name)
+        else:
+            run_context = contextlib.nullcontext()
     else:
         run_context = contextlib.nullcontext()
 
@@ -1810,14 +2050,15 @@ def train_and_evaluate(
                 sanitized_images = []
                 sanitized_targets = []
                 for image, target in zip(images, targets):
-                    boxes, labels, keep = sanitize_boxes_and_targets(
+                    boxes, labels, keep, unrecoverable = sanitize_boxes_and_targets(
                         target["boxes"], target["labels"], image
                     )
-                    if keep.numel() > 0 and not torch.all(keep):
+                    if unrecoverable:
                         warnings.warn(
-                            f"Dropped {int((~keep).sum().item())} invalid boxes in training batch.",
+                            f"Skipping image due to unrecoverable invalid boxes.",
                             UserWarning,
                         )
+                        continue
                     target["boxes"] = boxes
                     target["labels"] = labels
                     target["area"] = compute_box_areas(boxes).to(target["area"].device)
@@ -1909,11 +2150,18 @@ def train_and_evaluate(
                     else:
                         images = [image.to(device) for image in images]
                     targets = [{k: v.to(device) for k, v in t.items()} for t in targets]
+                    sanitized_images = []
                     sanitized_targets = []
                     for image, target in zip(images, targets):
-                        boxes, labels, _ = sanitize_boxes_and_targets(
+                        boxes, labels, keep, unrecoverable = sanitize_boxes_and_targets(
                             target["boxes"], target["labels"], image
                         )
+                        if unrecoverable:
+                            warnings.warn(
+                                f"Skipping validation image due to unrecoverable invalid boxes.",
+                                UserWarning,
+                            )
+                            continue
                         target["boxes"] = boxes
                         target["labels"] = labels
                         target["area"] = compute_box_areas(boxes).to(
@@ -1922,8 +2170,13 @@ def train_and_evaluate(
                         target["iscrowd"] = torch.zeros_like(
                             target["labels"], dtype=target["iscrowd"].dtype
                         )
+                        sanitized_images.append(image)
                         sanitized_targets.append(target)
+                    images = sanitized_images
                     targets = sanitized_targets
+                    if len(images) == 0:
+                        # nothing to evaluate in this batch
+                        continue
                     predictions = eval_model(images)
 
                     filtered_predictions = []
@@ -1988,12 +2241,21 @@ def train_and_evaluate(
                         total / max(1, len(train_dataloader)),
                         step=epoch + 1,
                     )
+                class_indices = map_metric.get("classes")
+                if isinstance(class_indices, torch.Tensor) and class_indices.dim() == 0:
+                    class_indices = class_indices.unsqueeze(0)
                 for key, value in map_metric.items():
                     if key == "map":
                         continue
                     if key.endswith("_per_class") and isinstance(value, torch.Tensor):
-                        for idx, class_value in enumerate(value):
-                            class_name = class_names.get(idx, f"class_{idx}")
+                        per_class_values = value
+                        if per_class_values.dim() == 0:
+                            per_class_values = per_class_values.unsqueeze(0)
+                        for idx, class_value in enumerate(per_class_values):
+                            class_id = idx
+                            if isinstance(class_indices, torch.Tensor) and idx < class_indices.numel():
+                                class_id = int(class_indices[idx].item())
+                            class_name = class_names.get(class_id, f"class_{class_id}")
                             metric_name = (
                                 f"val_{key}_{class_name.lower().replace(' ', '_').replace('/', '_')}"
                             )

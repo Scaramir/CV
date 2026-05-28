@@ -1,4 +1,5 @@
 import argparse
+import contextlib
 import copy
 import json
 import shutil
@@ -16,6 +17,8 @@ from amia import (
     build_fasterrcnn_model,
     build_retinanet_model,
     config_to_dict,
+    find_learning_rate,
+    find_optimal_batch_size,
     normalize_config,
     run_training,
     setup_mlflow,
@@ -25,13 +28,13 @@ from amia import (
 
 
 def suggest_augmentations(trial: optuna.Trial) -> AugmentationConfig:
-    rrc_scale_min = trial.suggest_float("aug_rrc_scale_min", 0.8, 1.0)
+    rrc_scale_min = trial.suggest_float("aug_rrc_scale_min", 0.9, 1.0)
     rrc_scale_max = trial.suggest_float("aug_rrc_scale_max", rrc_scale_min, 1.0)
-    rrc_ratio_min = trial.suggest_float("aug_rrc_ratio_min", 0.85, 1.0)
-    rrc_ratio_max = trial.suggest_float("aug_rrc_ratio_max", rrc_ratio_min, 1.15)
-    gamma_min = trial.suggest_float("aug_gamma_min", 0.85, 1.0)
-    gamma_max = trial.suggest_float("aug_gamma_max", gamma_min, 1.2)
-    noise_std_min = trial.suggest_float("aug_noise_std_min", 0.002, 0.01)
+    rrc_ratio_min = trial.suggest_float("aug_rrc_ratio_min", 0.9, 1.0)
+    rrc_ratio_max = trial.suggest_float("aug_rrc_ratio_max", rrc_ratio_min, 1.1)
+    gamma_min = trial.suggest_float("aug_gamma_min", 0.9, 1.0)
+    gamma_max = trial.suggest_float("aug_gamma_max", gamma_min, 1.1)
+    noise_std_min = trial.suggest_float("aug_noise_std_min", 0.001, 0.01)
     noise_std_max = trial.suggest_float("aug_noise_std_max", noise_std_min, 0.03)
     return AugmentationConfig(
         random_resized_crop_p=trial.suggest_float("aug_random_resized_crop_p", 0.0, 0.4),
@@ -39,23 +42,23 @@ def suggest_augmentations(trial: optuna.Trial) -> AugmentationConfig:
         random_resized_crop_ratio=(rrc_ratio_min, rrc_ratio_max),
         rotation_deg=trial.suggest_float("aug_rotation_deg", 0.0, 8.0),
         translate=trial.suggest_float("aug_translate", 0.0, 0.05),
-        scale=trial.suggest_float("aug_scale", 0.0, 0.12),
-        shear=trial.suggest_float("aug_shear", 0.0, 5.0),
+        scale=trial.suggest_float("aug_scale", 0.0, 0.1),
+        shear=trial.suggest_float("aug_shear", 0.0, 2.0),
         perspective=trial.suggest_float("aug_perspective", 0.0, 0.1),
-        perspective_p=trial.suggest_float("aug_perspective_p", 0.0, 0.2),
-        brightness=trial.suggest_float("aug_brightness", 0.0, 0.2),
-        contrast=trial.suggest_float("aug_contrast", 0.0, 0.2),
-        color_jitter_p=trial.suggest_float("aug_color_jitter_p", 0.4, 1.0),
+        perspective_p=trial.suggest_float("aug_perspective_p", 0.0, 0.1),
+        brightness=trial.suggest_float("aug_brightness", 0.0, 0.1),
+        contrast=trial.suggest_float("aug_contrast", 0.0, 0.1),
+        color_jitter_p=trial.suggest_float("aug_color_jitter_p", 0.1, 0.3),
         gamma_p=trial.suggest_float("aug_gamma_p", 0.0, 0.2),
         gamma_range=(gamma_min, gamma_max),
         sharpness_factor=trial.suggest_float("aug_sharpness_factor", 1.0, 2.0),
         sharpness_p=trial.suggest_float("aug_sharpness_p", 0.0, 0.3),
-        autocontrast_p=trial.suggest_float("aug_autocontrast_p", 0.0, 0.3),
-        equalize_p=trial.suggest_float("aug_equalize_p", 0.0, 0.2),
-        gaussian_blur_p=trial.suggest_float("aug_gaussian_blur_p", 0.0, 0.2),
-        gaussian_noise_p=trial.suggest_float("aug_gaussian_noise_p", 0.0, 0.2),
+        autocontrast_p=trial.suggest_float("aug_autocontrast_p", 0.0, 0.2),
+        equalize_p=trial.suggest_float("aug_equalize_p", 0.0, 1.0, step=1.0),
+        gaussian_blur_p=trial.suggest_float("aug_gaussian_blur_p", 0.0, 0.1),
+        gaussian_noise_p=trial.suggest_float("aug_gaussian_noise_p", 0.0, 0.1),
         gaussian_noise_std_range=(noise_std_min, noise_std_max),
-        random_erasing_p=trial.suggest_float("aug_random_erasing_p", 0.0, 0.2),
+        random_erasing_p=trial.suggest_float("aug_random_erasing_p", 0.0, 0.1),
         horizontal_flip_p=trial.suggest_float("aug_horizontal_flip_p", 0.0, 0.1),
     )
 
@@ -66,36 +69,24 @@ def build_trial_config(
     seed: int,
     train_limit: int | None = None,
     val_limit: int | None = None,
+    batch_size_override: int | None = None,
+    yolo_auto_batch: bool = False,
 ) -> TrainingConfig:
-    lr = trial.suggest_float("learning_rate", 1e-5, 3e-3, log=True)
-    weight_decay = trial.suggest_float("weight_decay", 1e-6, 3e-3, log=True)
-    scheduler_gamma = trial.suggest_float("scheduler_gamma", 0.9, 0.99)
-    num_epochs = trial.suggest_int("num_epochs", 1, 6)
+    num_epochs = 3
     label_merge_nms_iou_thresh = trial.suggest_float(
-        "label_merge_nms_iou_thresh", 0.3, 0.7
+        "label_merge_nms_iou_thresh", 0.4, 0.6
     )
-    rpn_nms_thresh = trial.suggest_float("rpn_nms_thresh", 0.3, 0.7)
-    box_nms_thresh = trial.suggest_float("box_nms_thresh", 0.3, 0.7)
-    box_score_thresh = trial.suggest_float("box_score_thresh", 0.05, 0.3)
-    optimizer_name = trial.suggest_categorical("optimizer", ["adamw", "adamax", "sgd"])
-    scheduler_name = trial.suggest_categorical(
-        "scheduler", ["cosine", "onecycle", "exponential"]
-    )
-    warmup_epochs = trial.suggest_int("warmup_epochs", 0, 2)
-    use_ema = trial.suggest_categorical("use_ema", [False, True])
-    ema_decay = trial.suggest_float("ema_decay", 0.995, 0.9999)
+    rpn_nms_thresh = trial.suggest_float("rpn_nms_thresh", 0.4, 0.7)
+    box_nms_thresh = trial.suggest_float("box_nms_thresh", 0.4, 0.7)
+    box_score_thresh = trial.suggest_float("box_score_thresh", 0.05, 0.15)
+    optimizer_name = "adamw"
+    scheduler_name = "cyclic"
 
     config = TrainingConfig(
         model_type=model_type,
         epochs=num_epochs,
-        lr=lr,
-        weight_decay=weight_decay,
-        scheduler_gamma=scheduler_gamma,
         optimizer_name=optimizer_name,
         scheduler_name=scheduler_name,
-        warmup_epochs=warmup_epochs,
-        use_ema=use_ema,
-        ema_decay=ema_decay,
         label_merge_nms_iou_thresh=label_merge_nms_iou_thresh,
         rpn_nms_thresh=rpn_nms_thresh,
         box_nms_thresh=box_nms_thresh,
@@ -108,12 +99,14 @@ def build_trial_config(
         val_limit=val_limit,
         auto_scale_batch_size=False,
     )
+    if batch_size_override is not None:
+        config.batch_size = batch_size_override
     config.augmentations = suggest_augmentations(trial)
 
     if model_type == "yolo11":
         config.yolo_conf_thresh = trial.suggest_float("yolo_conf_thresh", 0.001, 0.2)
         config.yolo_iou_thresh = trial.suggest_float("yolo_iou_thresh", 0.3, 0.8)
-        config.yolo_auto_batch = False
+        config.yolo_auto_batch = yolo_auto_batch
         config.yolo_mosaic = trial.suggest_float("yolo_mosaic", 0.0, 1.0)
         config.yolo_mixup = trial.suggest_float("yolo_mixup", 0.0, 0.2)
         config.yolo_copy_paste = trial.suggest_float("yolo_copy_paste", 0.0, 0.2)
@@ -128,6 +121,25 @@ def build_trial_config(
         config.yolo_erasing = trial.suggest_float("yolo_erasing", 0.0, 0.2)
 
     return config
+
+
+def resolve_optuna_batch_size(
+    model_type: str,
+    seed: int,
+    train_limit: int | None = None,
+    val_limit: int | None = None,
+) -> int:
+    config = TrainingConfig(
+        model_type=model_type,
+        log_with_mlflow=False,
+        seed=seed,
+        train_limit=train_limit,
+        val_limit=val_limit,
+        auto_scale_batch_size=True,
+    )
+    config = normalize_config(config)
+    dataloaders, num_classes, _, _ = build_dataloaders_from_config(config)
+    return find_optimal_batch_size(config, num_classes, dataloaders["train"].dataset)
 
 
 def save_best_trial(
@@ -231,64 +243,117 @@ def objective(
     best_state: dict | None = None,
     checkpoint_dir: Path | None = None,
     prune_metric: str = "map",
+    batch_size_override: int | None = None,
+    yolo_auto_batch: bool = False,
 ) -> float:
-    config = build_trial_config(trial, model_type, seed, train_limit, val_limit)
+    config = build_trial_config(
+        trial,
+        model_type,
+        seed,
+        train_limit,
+        val_limit,
+        batch_size_override,
+        yolo_auto_batch,
+    )
     dataloaders, num_classes, train_ids, test_ids = build_dataloaders_from_config(config)
     reporter = make_pruning_reporter(trial, prune_metric)
+    run_context = contextlib.nullcontext()
+    if config.log_with_mlflow:
+        setup_mlflow(config)
+        parent_active = mlflow.active_run() is not None
+        run_context = mlflow.start_run(run_name=config.run_name, nested=parent_active)
 
-    if model_type == "fasterrcnn":
-        model = build_fasterrcnn_model(
-            num_classes=num_classes,
-            rpn_nms_thresh=config.rpn_nms_thresh,
-            box_nms_thresh=config.box_nms_thresh,
-            box_score_thresh=config.box_score_thresh,
-        )
-        _, _, map_history = train_and_evaluate(
-            model,
-            dataloaders["train"],
-            dataloaders["test"],
-            config=config,
+    with run_context:
+        if config.log_with_mlflow:
+            mlflow.log_params(trial.params)
+            mlflow.set_tag("optuna_trial_number", trial.number)
+            mlflow.set_tag("optuna_study", trial.study.study_name)
+            active_run = mlflow.active_run()
+            if active_run is not None:
+                trial.set_user_attr("mlflow_run_id", active_run.info.run_id)
+
+        if model_type == "fasterrcnn":
+            model = build_fasterrcnn_model(
+                num_classes=num_classes,
+                rpn_nms_thresh=config.rpn_nms_thresh,
+                box_nms_thresh=config.box_nms_thresh,
+                box_score_thresh=config.box_score_thresh,
+            )
+            max_lr = find_learning_rate(config, num_classes, dataloaders["train"])
+            config.lr = max_lr / 10.0
+            config.cyclic_max_lr = max_lr
+            config.scheduler_name = "cyclic"
+            _, _, map_history = train_and_evaluate(
+                model,
+                dataloaders["train"],
+                dataloaders["test"],
+                config=config,
+                train_ids=train_ids,
+                test_ids=test_ids,
+                reporter=reporter,
+                start_mlflow_run=False,
+            )
+            map_value = map_history[-1] if map_history else 0.0
+            save_best_trial(
+                model_type,
+                map_value,
+                config,
+                trial.params,
+                model,
+                best_state,
+                checkpoint_dir,
+            )
+            return map_value
+
+        if model_type == "retinanet":
+            model = build_retinanet_model(
+                num_classes=num_classes,
+                box_nms_thresh=config.box_nms_thresh,
+                box_score_thresh=config.box_score_thresh,
+            )
+            max_lr = find_learning_rate(config, num_classes, dataloaders["train"])
+            config.lr = max_lr / 10.0
+            config.cyclic_max_lr = max_lr
+            config.scheduler_name = "cyclic"
+            _, _, map_history = train_and_evaluate(
+                model,
+                dataloaders["train"],
+                dataloaders["test"],
+                config=config,
+                train_ids=train_ids,
+                test_ids=test_ids,
+                reporter=reporter,
+                start_mlflow_run=False,
+            )
+            map_value = map_history[-1] if map_history else 0.0
+            save_best_trial(
+                model_type,
+                map_value,
+                config,
+                trial.params,
+                model,
+                best_state,
+                checkpoint_dir,
+            )
+            return map_value
+
+        model, _, map_history, _ = train_yolo11(
+            config,
             train_ids=train_ids,
-            test_ids=test_ids,
-            reporter=reporter,
-            nested_run=True,
+            val_ids=test_ids,
+            start_mlflow_run=False,
         )
         map_value = map_history[-1] if map_history else 0.0
         save_best_trial(
-            model_type, map_value, config, trial.params, model, best_state, checkpoint_dir
-        )
-        return map_value
-
-    if model_type == "retinanet":
-        model = build_retinanet_model(
-            num_classes=num_classes,
-            box_nms_thresh=config.box_nms_thresh,
-            box_score_thresh=config.box_score_thresh,
-        )
-        _, _, map_history = train_and_evaluate(
+            model_type,
+            map_value,
+            config,
+            trial.params,
             model,
-            dataloaders["train"],
-            dataloaders["test"],
-            config=config,
-            train_ids=train_ids,
-            test_ids=test_ids,
-            reporter=reporter,
-            nested_run=True,
-        )
-        map_value = map_history[-1] if map_history else 0.0
-        save_best_trial(
-            model_type, map_value, config, trial.params, model, best_state, checkpoint_dir
+            best_state,
+            checkpoint_dir,
         )
         return map_value
-
-    model, _, map_history, _ = train_yolo11(
-        config, train_ids=train_ids, val_ids=test_ids, nested_run=True
-    )
-    map_value = map_history[-1] if map_history else 0.0
-    save_best_trial(
-        model_type, map_value, config, trial.params, model, best_state, checkpoint_dir
-    )
-    return map_value
 
 
 def run_study(
@@ -303,6 +368,7 @@ def run_study(
     pruner_startup_trials: int = 5,
     pruner_warmup_steps: int = 1,
     pruner_interval_steps: int = 1,
+    auto_batch_size: bool = False,
 ):
     storage = f"sqlite:///{storage_path.as_posix()}"
     study_name = f"amia-optuna-{model_type}"
@@ -328,6 +394,20 @@ def run_study(
         run_name=f"optuna-study-{model_type}",
         log_with_mlflow=True,
     )
+    batch_size_override = None
+    yolo_auto_batch = False
+    if auto_batch_size:
+        if model_type == "yolo11":
+            yolo_auto_batch = True
+            base_config.yolo_auto_batch = True
+        else:
+            batch_size_override = resolve_optuna_batch_size(
+                model_type,
+                seed,
+                train_limit=train_limit,
+                val_limit=val_limit,
+            )
+            base_config.batch_size = batch_size_override
     setup_mlflow(base_config)
     nested_parent = mlflow.active_run() is not None
     with mlflow.start_run(run_name=base_config.run_name, nested=nested_parent):
@@ -341,6 +421,8 @@ def run_study(
                 best_state,
                 checkpoint_dir,
                 prune_metric,
+                batch_size_override,
+                yolo_auto_batch,
             ),
             n_trials=trials,
         )
@@ -389,12 +471,17 @@ def main():
     parser.add_argument("--val-limit", type=int, default=None)
     parser.add_argument("--print-best", action="store_true")
     parser.add_argument("--train-best", action="store_true")
-    parser.add_argument("--train-best-epochs", type=int, default=50)
+    parser.add_argument("--train-best-epochs", type=int, default=100)
     parser.add_argument("--prune-metric", choices=["map", "train_loss"], default="map")
     parser.add_argument("--pruner-patience", type=int, default=5)
     parser.add_argument("--pruner-startup-trials", type=int, default=5)
     parser.add_argument("--pruner-warmup-steps", type=int, default=1)
     parser.add_argument("--pruner-interval-steps", type=int, default=1)
+    parser.add_argument(
+        "--auto-batch-size",
+        action="store_true",
+        help="Find a single batch size per model before running Optuna trials.",
+    )
     args = parser.parse_args()
 
     args.study_dir.mkdir(parents=True, exist_ok=True)
@@ -424,6 +511,7 @@ def main():
             args.pruner_startup_trials,
             args.pruner_warmup_steps,
             args.pruner_interval_steps,
+            args.auto_batch_size,
         )
 
 
