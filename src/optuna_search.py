@@ -78,7 +78,7 @@ def build_trial_config(
     )
     rpn_nms_thresh = trial.suggest_float("rpn_nms_thresh", 0.4, 0.7)
     box_nms_thresh = trial.suggest_float("box_nms_thresh", 0.4, 0.7)
-    box_score_thresh = trial.suggest_float("box_score_thresh", 0.05, 0.15)
+    box_score_thresh = trial.suggest_float("box_score_thresh", 0.03, 0.1)
     optimizer_name = "adamw"
     scheduler_name = "cyclic"
 
@@ -206,8 +206,8 @@ def log_best_to_mlflow(
 
 
 def build_pruner(
-    patience: int = 5,
-    n_startup_trials: int = 5,
+    patience: int = 3,
+    n_startup_trials: int = 1,
     n_warmup_steps: int = 1,
     interval_steps: int = 1,
 ):
