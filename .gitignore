@@ -10,3 +10,5 @@ mlflow.db
 *.pt
 openvino/
 runs/
+optuna_studies*/
+.github/copilot-instructions.md
